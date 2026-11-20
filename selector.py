@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 DATA = Path("/data")
-WORKERS = 3
+WORKERS = 4
 
 
 def split(tests: list[dict], worker_count: int) -> list[list[int]]:
