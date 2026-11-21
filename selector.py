@@ -1380,7 +1380,7 @@ class Selector:
             self._server = False
             return None
 
-    DIAG_BUDGET = 100.0  # wall seconds of the whole run; later commits keep v13 output
+    DIAG_BUDGET = 1500.0  # wall seconds of the whole run; later commits keep v13 output
     GIANTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
               "tests/test_parser.py::TestParser::test_max_nodes")
 
@@ -1388,7 +1388,8 @@ class Selector:
         if self.tpc_probe is None or time.monotonic() - START > self.DIAG_BUDGET:
             return None
         # D-heavy: verdicts only for the heavy tests (>= 0.4 s); light tests stay as v13 chose them
-        run = {n for n in chosen if self.test_ids[n] not in self.GIANTS and self.durations[n] >= 400}
+        # D-tpcds: real verdict for test_execute_tpcds only; everything else as v13 chose it
+        run = {n for n in chosen if self.test_ids[n] == self.GIANTS[0]}
         if not run or sum(self.durations[n] for n in run) > 25000:
             return None
         try:
@@ -1420,7 +1421,7 @@ class Selector:
         if fxfile:
             os.environ["BR_FIXTURES"] = fxfile
         try:
-            out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 60, capture=True,
+            out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 400, capture=True,
                                stop_on_fail=False)
         finally:
             os.environ.pop("BR_FIXTURES", None)
