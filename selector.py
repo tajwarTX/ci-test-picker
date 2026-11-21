@@ -1349,6 +1349,15 @@ def main() -> None:
                 chosen, why = sel.select(patch.read_text(errors="replace"))
             except Exception as e:
                 chosen, why = all_numbers, [f"selector error {e!r} -> ALL"]
+            # DIAGNOSTIC BUILD ONLY (branch diag-no-classlevel): commits whose code points are
+            # ALL class/setting/entry/file level (no statement/function point) select nothing.
+            # NOT a final candidate.
+            txt = " ".join(why)
+            import re as _re
+            pts = _re.findall(r"points stmt (\d+), func (\d+), class (\d+), setting (\d+), entry (\d+), file (\d+)", txt)
+            if pts and all(int(a) == 0 and int(b) == 0 for a, b, *_ in pts) and "opened by tests" not in txt \
+                    and "ALL" not in txt and "swap" not in txt:
+                chosen = set()
         chosen = {n for n in chosen if n in durations}
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
