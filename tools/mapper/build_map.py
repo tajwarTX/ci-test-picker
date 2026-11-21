@@ -24,6 +24,14 @@ SRC = "/src"
 tests = json.load(open(sys.argv[1]))["tests"]
 out_path = sys.argv[2]
 run_dirs = sys.argv[3:]
+# A run where any test did not finish cleanly (crash, timeout) is incomplete: worker
+# processes may have written data for it while the main process never did.
+for _run in run_dirs:
+    _log = os.path.join(_run, "isolated_log.json")
+    if os.path.exists(_log):
+        _bad = [r["id"] for r in json.load(open(_log)) if r["rc"] != 0]
+        if _bad:
+            sys.exit(f"REFUSING TO BUILD: {_run} has {len(_bad)} tests that did not finish cleanly, e.g. {_bad[:3]}")
 number = {t["id"]: t["number"] for t in tests}
 unknown_ctx = set()
 

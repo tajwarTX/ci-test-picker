@@ -40,6 +40,8 @@ import time
 
 SRC = os.environ.get("MAP_SRC", "/src")
 TEST = os.environ.get("MAP_TEST", "")
+# set for re-profiling tests that are too slow with exact probing (conservative: more tests)
+CONSERVATIVE_SAME_TYPE = os.environ.get("CMP_CONSERVATIVE") == "1"
 
 OPS = {
     "Is": operator.is_, "IsNot": operator.is_not, "Eq": operator.eq, "NotEq": operator.ne,
@@ -54,6 +56,8 @@ PARTNERS = {
 _hit: set = set()
 _differ: dict = {}
 _tainted = False
+_taint_info: list = []
+_SCALARS = (type(None), bool, int, float, str, bytes)
 _local = threading.local()  # per thread: "probing" flag and the undo log of _hash stores
 
 
@@ -81,6 +85,12 @@ def __cmp__(site, op, left, right):
     if type(result) is not bool:
         _all_differ(site, op)
         return result
+    if CONSERVATIVE_SAME_TYPE and op in ("Is", "IsNot") and (hasattr(left, "_hash") or hasattr(right, "_hash")):
+        # `==`/`!=` with a sqlglot expression on either side can hash whole trees (slow
+        # once caching is undone) or build a new expression (may import modules), so
+        # it is not probed: count it as differing.
+        _all_differ(site, op)
+        return result
     _local.busy = True  # comparisons run by __eq__ & co. while probing are not recorded
     _local.undo = []
     n_modules = len(sys.modules)
@@ -101,8 +111,11 @@ def __cmp__(site, op, left, right):
             obj._hash = old
         _local.undo = None
         _local.busy = False
-        if len(sys.modules) != n_modules:
+        if len(sys.modules) != n_modules and not (type(left) in _SCALARS and type(right) in _SCALARS):
+            # (a probe between plain scalars runs no Python code; an import seen then
+            # comes from an unrelated finalizer, not from the probe)
             _tainted = True
+            _taint_info.append([site, "modules", len(sys.modules) - n_modules, threading.current_thread().name])
     return result
 
 
@@ -118,6 +131,7 @@ def __cmp_effect__():
     global _tainted
     if getattr(_local, "busy", False):
         _tainted = True
+        _taint_info.append(["_try_load", "effect"])
 
 
 builtins.__cmp__ = __cmp__
@@ -195,4 +209,4 @@ def dump():
     out = os.environ.get("MAP_OUT", "/out")
     with open(os.path.join(out, f"cmp.{os.getpid()}.{time.time_ns()}.json"), "w") as f:
         json.dump({"test": TEST, "hit": sorted(_hit), "differ": {s: sorted(v) for s, v in _differ.items()},
-                   "tainted": _tainted}, f)
+                   "tainted": _tainted, "taint_info": _taint_info[:20]}, f)
