@@ -13,7 +13,10 @@ Then the chosen tests are split over the number of workers (1..8) that costs lea
 
 import gzip
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -75,6 +78,20 @@ def parse_patch(text: str) -> list[FileChange]:
             body = []
             pos = old_start  # old line number of the next old line
             i += 1
+            # A "block" is a run of -/+ lines between context lines. A block that only
+            # replaces lines one for one touches just the removed lines. A block that
+            # adds more lines than it removes inserts new code, which may start a new
+            # statement next to its neighbours, so those neighbours count too.
+            minus = plus = 0
+            block_start = pos
+
+            def close_block():
+                if plus > minus:
+                    cur.points.add(pos - 1)
+                    cur.points.add(pos)
+                    if minus:
+                        cur.points.add(block_start - 1)
+
             # Read exactly as many lines as the header promises.
             while i < len(lines) and (old_left > 0 or new_left > 0):
                 l = lines[i]
@@ -84,17 +101,24 @@ def parse_patch(text: str) -> list[FileChange]:
                 tag = l[:1] or " "
                 body.append(l if l else " ")
                 if tag == "-":
+                    if not minus and not plus:
+                        block_start = pos
                     cur.points.add(pos)
                     pos += 1
                     old_left -= 1
+                    minus += 1
                 elif tag == "+":
-                    cur.points.add(pos - 1)  # inserted between old lines pos-1 and pos
-                    cur.points.add(pos)
+                    if not minus and not plus:
+                        block_start = pos
                     new_left -= 1
+                    plus += 1
                 else:
+                    close_block()
+                    minus = plus = 0
                     pos += 1
                     old_left -= 1
                     new_left -= 1
+            close_block()
             while i < len(lines) and lines[i].startswith("\\"):
                 i += 1
             cur.hunks.append((old_start, body))
@@ -156,13 +180,62 @@ def same_code(old: str, new: str) -> bool:
         return False
 
 
+class ImportChecker:
+    """Imports every sqlglot module from a patched copy of the pristine tree in /tmp."""
+
+    def __init__(self, src=SRC, work=Path("/tmp/ic"), module_list=APP / "import_ok.json"):
+        self.src, self.work, self.module_list = src, work, module_list
+        self.ready = False
+
+    def _setup(self):
+        if self.work.exists():
+            shutil.rmtree(self.work)
+        self.work.mkdir(parents=True)
+        # copy2 keeps modification times, so the build-time bytecode stays valid
+        shutil.copytree(self.src / "sqlglot", self.work / "sqlglot", copy_function=shutil.copy2)
+        self.ready = True
+
+    def __call__(self, patched: dict) -> bool:
+        """patched: {"sqlglot/x.py": new text}. True only if every module imports."""
+        if not self.module_list.exists():
+            return False
+        if not self.ready:
+            self._setup()
+        saved = {}
+        try:
+            for rel, text in patched.items():
+                f = self.work / rel
+                st = f.stat()
+                saved[rel] = (f.read_bytes(), st.st_atime_ns, st.st_mtime_ns)
+                f.write_text(text)
+            env = dict(os.environ, PYTHONPATH=str(self.work), PYTHONDONTWRITEBYTECODE="1")
+            mods = [rel[:-3].replace("/", ".").removesuffix(".__init__") for rel in patched]
+            proc = subprocess.run(
+                [sys.executable, str(APP / "importcheck.py"), str(self.module_list), *mods],
+                cwd="/tmp", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+        finally:
+            for rel, (data, atime, mtime) in saved.items():
+                f = self.work / rel
+                f.write_bytes(data)
+                os.utime(f, ns=(atime, mtime))
+
+
 class Selector:
-    def __init__(self, tests, mp):
+    def __init__(self, tests, mp, import_check=None):
         self.all = {t["number"] for t in tests}
         self.sets = [set(s) for s in mp["sets"]]
         self.files = mp["files"]
         self.opened = mp["opened"]
         self.stmt_cache: dict = {}
+        self.import_check = import_check or ImportChecker()
+        # per commit
+        self.patched: dict = {}
+        self.fallback: set = set()
 
     def whole_file(self, path):
         info = self.files.get(path)
@@ -197,6 +270,8 @@ class Selector:
             stmts = ({l: s for l, s in info.get("stmts", [])}, {l: f for l, f in info.get("multi", [])})
             self.stmt_cache[path] = stmts
         stmt_set, multi = stmts
+        if path.startswith("sqlglot/"):
+            self.patched[path] = new_text
         kinds = []
         for p in ch.points:
             best = None
@@ -204,9 +279,37 @@ class Selector:
                 if body <= p <= end and (best is None or end - body < best[1] - best[0]):
                     best = (body, end, s)
             if best is None:
-                # module / class level, decorators, signatures: run at import time
-                chosen |= self.whole_file(path)
-                kinds.append("file")
+                # Outside any function body: module level, class body, decorators,
+                # signatures. All of it runs at import time.
+                cls = None
+                if path.startswith("sqlglot/"):
+                    for start, body, end, s in info.get("classes", []):
+                        if body <= p <= end and (cls is None or end - body < cls[1] - cls[0]):
+                            cls = (body, end, s)
+                setting = None
+                for start, end, s in info.get("settings", []):
+                    if start <= p <= end:
+                        setting = s
+                if cls is not None and cls[2] >= 0 and setting is not None:
+                    # An UPPER_CASE class setting: tests that used this class (or a
+                    # subclass) AND ran a line that reads the setting by name.
+                    chosen |= self.sets[cls[2]] & self.sets[setting]
+                    self.fallback |= self.whole_file(path)
+                    kinds.append("setting")
+                elif cls is not None and cls[2] >= 0:
+                    # Class body / method header: tests that used this class (or a
+                    # subclass), plus tests that ran a method whose header this is.
+                    chosen |= self.sets[cls[2]]
+                    for start, body, end, s in funcs:
+                        if start <= p < body:
+                            chosen |= self.sets[s]
+                    # ...but only if the patched package still imports (checked once
+                    # per commit); otherwise everything that loads this file.
+                    self.fallback |= self.whole_file(path)
+                    kinds.append("class")
+                else:
+                    chosen |= self.whole_file(path)
+                    kinds.append("file")
             elif multi.get(p, p) in stmt_set:
                 # an executable statement: only tests that actually ran it can notice
                 chosen |= self.sets[stmt_set[multi.get(p, p)]]
@@ -216,7 +319,7 @@ class Selector:
                 chosen |= self.sets[best[2]]
                 kinds.append("func")
         why.append(f"{path}: points stmt {kinds.count('stmt')}, func {kinds.count('func')}, "
-                   f"file {kinds.count('file')}")
+                   f"class {kinds.count('class')}, setting {kinds.count('setting')}, file {kinds.count('file')}")
         return chosen
 
     def select_other(self, path: str, why: list) -> set:
@@ -242,6 +345,7 @@ class Selector:
         if not changes:
             return self.all, ["no file changes parsed -> ALL"]
         chosen: set = set()
+        self.patched, self.fallback = {}, set()
         for ch in changes:
             if ch.binary:
                 chosen |= self.all
@@ -257,6 +361,12 @@ class Selector:
                 chosen |= self.select_py(ch, ch.old, why)
             else:
                 chosen |= self.select_other(ch.old, why)
+        if self.fallback - chosen:
+            if self.import_check(self.patched):
+                why.append("class-level change: patched package imports OK")
+            else:
+                why.append("class-level change: import check FAILED -> whole file")
+                chosen |= self.fallback
         return chosen, why
 
 

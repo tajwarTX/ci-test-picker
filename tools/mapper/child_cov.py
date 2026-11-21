@@ -15,6 +15,22 @@ def start():
         return
     import atexit
 
+    if os.environ.get("MAP_MODE") == "usage":
+        import class_usage
+
+        class_usage.install()
+        atexit.register(class_usage.dump, test)
+        real_exit = os._exit
+
+        def _exit_usage(code):
+            try:
+                class_usage.dump(test)
+            finally:
+                real_exit(code)
+
+        os._exit = _exit_usage
+        return
+
     import coverage
 
     src = os.environ.get("MAP_SRC", "/src")

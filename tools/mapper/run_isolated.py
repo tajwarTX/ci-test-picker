@@ -20,7 +20,7 @@ def run(test):
     env = dict(os.environ, MAP_TEST=test["id"])
     start = time.time()
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "covmap_plugin", "-q", "-p", "no:cacheprovider",
+        [sys.executable, "-m", "pytest", "-p", os.environ.get("MAP_PLUGIN", "covmap_plugin"), "-q", "-p", "no:cacheprovider",
          "-x", test["id"]],
         env=env, cwd="/src", capture_output=True, text=True, timeout=900,
     )

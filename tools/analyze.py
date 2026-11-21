@@ -21,7 +21,8 @@ tests = json.load(open(ROOT / "sample/tests.json"))["tests"]
 answers = json.load(open(ROOT / "sample/answers.json"))["commits"]
 dur = {t["number"]: round(t["seconds"] * 1000) for t in tests}
 name = {t["number"]: t["id"] for t in tests}
-sel = S.Selector(tests, json.load(gzip.open(map_path, "rt")))
+# import check assumed to pass here (laptop has no patched tree); tools/eval.sh runs it for real
+sel = S.Selector(tests, json.load(gzip.open(map_path, "rt")), import_check=lambda patched: True)
 
 total = misses = 0
 for patch in sorted((ROOT / "sample/commits").glob("*.patch")):
