@@ -1727,10 +1727,9 @@ def main() -> None:
         if sel is not None and chosen:
             # DIAGNOSTIC ONLY (branch diag-floor, not a final candidate): run every selected
             # test except the two giants on the patched code and list only real failures.
-            done = sel.diagnose_all(patch_text, chosen, why)
-            if done is None:
-                chosen = sel.verify_by_running(patch_text, chosen, why)
-            else:
+            chosen = sel.verify_by_running(patch_text, chosen, why)  # exactly v13
+            done = sel.diagnose_all(patch_text, chosen, why) if chosen else None
+            if done is not None:
                 chosen = done
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
