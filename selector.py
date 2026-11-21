@@ -884,36 +884,49 @@ class Selector:
 
     SOURCE_READ = ("sqlglot/typing/",)  # tests/test_typing.py reads these files' source text
 
-    def docstring_only(self, path, original, new_text):
+    def no_runtime_effect(self, path, original, new_text):
+        """"docstring" / "overload" if the ONLY differences are docstring text (each
+        docstring still non-empty, or still empty) or code inside @overload stubs; else None."""
         if not path.startswith("sqlglot/") or path.startswith(self.SOURCE_READ):
-            return False
-        if original.count("\n") != new_text.count("\n"):
-            return False
+            return None
         try:
             a, b = ast.parse(original), ast.parse(new_text)
         except SyntaxError:
+            return None
+
+        def is_overload(fn):
+            for d in fn.decorator_list:
+                if (isinstance(d, ast.Name) and d.id == "overload") or \
+                        (isinstance(d, ast.Attribute) and d.attr == "overload" and isinstance(d.value, ast.Name)
+                         and d.value.id in ("t", "typing")):
+                    return True
             return False
 
-        def docs(tree):
-            out = []
+        def normalize(tree):
+            docs, stubs = [], []
             for n in ast.walk(tree):
                 if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
                     d = n.body[0]
                     if isinstance(d, ast.Expr) and isinstance(d.value, ast.Constant) and isinstance(d.value.value, str):
-                        out.append(d)
-            return out
+                        docs.append(d.value.value)
+                        d.value.value = ""
+            for n in ast.walk(tree):
+                for field in ("body", "orelse", "finalbody"):
+                    seq = getattr(n, field, None)
+                    if isinstance(seq, list):
+                        for i, st in enumerate(seq):
+                            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_overload(st):
+                                stubs.append(ast.dump(st))
+                                seq[i] = ast.Pass()
+            return docs, stubs, ast.dump(tree)
 
-        da, db = docs(a), docs(b)
-        if len(da) != len(db) or not da:
-            return False
-        changed = False
-        for x, y in zip(da, db):
-            if (x.lineno, x.end_lineno) != (y.lineno, y.end_lineno) or bool(x.value.value) != bool(y.value.value):
-                return False
-            if x.value.value != y.value.value:
-                changed = True
-            x.value.value = y.value.value = ""
-        return changed and ast.dump(a) == ast.dump(b)
+        da, sa, ta = normalize(a)
+        db, sb, tb = normalize(b)
+        if ta != tb or len(da) != len(db) or any(bool(x) != bool(y) for x, y in zip(da, db)):
+            return None
+        if sa != sb:
+            return "overload"
+        return "docstring" if da != db else None
 
     def whole_file(self, path):
         info = self.files.get(path)
@@ -943,11 +956,13 @@ class Selector:
             # same program (only line numbers can differ)
             why.append(f"{path}: same syntax tree (comment/format edit) -> none")
             return set()
-        if self.docstring_only(path, original, new_text):
-            # only docstring TEXT changed (same lines, still non-empty): no scored test
-            # reads docstrings, and sqlglot's one reader (Expr.__init_subclass__) only
-            # checks emptiness; files whose source a test reads are excluded
-            why.append(f"{path}: docstring text only -> none")
+        kind = self.no_runtime_effect(path, original, new_text)
+        if kind == "docstring" or (kind == "overload" and self.import_check({path: new_text})):
+            # Only docstring text (still non-empty) or @overload stubs changed: no scored
+            # test reads docstrings, line numbers or overload stubs, and sqlglot's one
+            # docstring reader (Expr.__init_subclass__) only checks emptiness. Files whose
+            # source a test reads are excluded; stub changes must still import.
+            why.append(f"{path}: {kind} change only (no runtime effect) -> none")
             return set()
         if info is None:
             why.append(f"{path}: never run by any test -> none")
