@@ -161,6 +161,7 @@ def rebuild(original: str, hunks) -> "str | None":
 
 
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=]")
+PLAIN_KEY = re.compile(r"[A-Za-z0-9_]+")
 # what comparison_swaps' pre-filter removes before comparing an old and a new line
 _CMP_STRIP = re.compile(r"\s+|==|!=|<=|>=|<|>|\bis\b|\bnot\b")
 _BOP_STRIP = re.compile(r"\s+|\band\b|\bor\b")
@@ -610,6 +611,7 @@ class Selector:
         self.stmt_cache: dict = {}
         self.import_check = import_check or ImportChecker()
         self.containers = mp.get("containers", {})
+        self.trie_plain_singles = mp.get("trie_plain_singles")
         self.container_index: dict = {}
         for cid, c in self.containers.items():
             self.container_index.setdefault(c["file"], []).append((c["start"], c["end"], cid))
@@ -788,6 +790,14 @@ class Selector:
         for k in changed:
             if k in info["acc"]:
                 out |= self.sets[info["acc"][k]]
+        if "trie" in info:
+            # the tokenizer keyword trie holds a key only if it has a space or a
+            # single-token string in it; a plain-word key can never change the trie
+            singles = self.trie_plain_singles
+            plain = lambda k: (singles is not None and k.startswith("str:") and PLAIN_KEY.fullmatch(k[4:])
+                               and not any(x in k[4:] for x in singles))
+            if not all(plain(k) for k in changed):
+                out |= self.sets[info["trie"]]
         return out
 
     def same_tree(self, path, original, new_text) -> bool:

@@ -17,6 +17,7 @@ import glob
 import gzip
 import json
 import os
+import re
 import sys
 
 
@@ -262,7 +263,44 @@ ceu_files = [f for run in run_dirs for f in glob.glob(os.path.join(run, "ceu*.js
 containers_out = {}
 if ceu_files:
     W: dict = {}
+    T: dict = {}  # cid -> tests whose ONLY wholesale use of it was the tokenizer keyword-trie build
     A: dict = {}
+    infn = set()
+    _tok = ast.parse(open(os.path.join(SRC, "sqlglot/tokens.py")).read())
+    _trie = [n for n in ast.walk(_tok) if isinstance(n, ast.Assign) and len(n.targets) == 1
+             and isinstance(n.targets[0], ast.Attribute) and n.targets[0].attr == "_KEYWORD_TRIE"]
+    if len(_trie) != 1:
+        sys.exit("REFUSING TO BUILD: keyword-trie build site not found")
+    # the tuple `(*cls.KEYWORDS, *cls._COMMENTS, ...)` the trie is filtered from: Python
+    # attributes its star-unpacking to the tuple's lines. Every key unpacked there enters
+    # the trie only if it has a space or a single-token string in it; the filter itself
+    # (cls.SINGLE_TOKENS) is on a later line and stays wholesale.
+    _tup = [n for n in ast.walk(_trie[0]) if isinstance(n, ast.Tuple)]
+    _filt = [n for n in ast.walk(_trie[0]) if isinstance(n, ast.Attribute) and n.attr == "SINGLE_TOKENS"]
+    if len(_tup) != 1 or not _tup[0].elts or not all(
+            isinstance(e, ast.Starred) and isinstance(e.value, ast.Attribute) and isinstance(e.value.value, ast.Name)
+            and e.value.value.id == "cls" for e in _tup[0].elts) or \
+            "KEYWORDS" not in [e.value.attr for e in _tup[0].elts] or \
+            len(_filt) != 1 or _filt[0].lineno <= _tup[0].end_lineno:
+        sys.exit("REFUSING TO BUILD: keyword-trie build is not shaped as expected")
+    TRIE_SITES = {f"sqlglot/tokens.py:{ln}" for ln in range(_tup[0].lineno, _tup[0].end_lineno + 1)}
+    import subprocess
+    _r = subprocess.run([sys.executable, "-c", """
+import json, re, sqlglot
+from sqlglot.dialects.dialect import Dialect, Dialects
+from sqlglot.tokens import Tokenizer
+for d in Dialects:
+    Dialect.get_or_raise(d)
+seen, todo = set(), [Tokenizer]
+while todo:
+    c = todo.pop()
+    if c not in seen:
+        seen.add(c); todo.extend(c.__subclasses__())
+print(json.dumps(sorted({k for c in seen for k in c.SINGLE_TOKENS if re.fullmatch(r"[A-Za-z0-9_]+", k)})))
+"""], capture_output=True, text=True, cwd=SRC, env={**os.environ, "MAP_MODE": ""})
+    if _r.returncode:
+        sys.exit("REFUSING TO BUILD: cannot list SINGLE_TOKENS: " + _r.stderr[-500:])
+    TRIE_PLAIN_SINGLES = json.loads(_r.stdout)
     edges: dict = {}
     kind, where, entries = {}, {}, {}
     seen_tests = set()
@@ -272,8 +310,12 @@ if ceu_files:
         if n is None:
             continue
         seen_tests.add(n)
+        if "whole_at" not in d:
+            sys.exit(f"REFUSING TO BUILD: {path} has no wholesale call sites (old profiler)")
+        infn.update(d["infn"])
         for c in d["whole"]:
-            W.setdefault(c, set()).add(n)
+            at = set(d["whole_at"].get(c, ["?"]))
+            (T if at <= TRIE_SITES else W).setdefault(c, set()).add(n)
         for c, keys in d["acc"].items():
             per = A.setdefault(c, {})
             for k in keys:
@@ -322,8 +364,9 @@ if ceu_files:
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                 if node.value.lineno <= line <= (node.value.end_lineno or node.value.lineno):
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    names = [t.id for t in targets if isinstance(t, ast.Name)]
-                    return names[0] if len(names) == 1 else None
+                    names = [t.id if isinstance(t, ast.Name) else t.attr for t in targets
+                             if isinstance(t, ast.Name) or isinstance(t, ast.Attribute) and re.match(r"[A-Z][A-Z0-9_]*\Z", t.attr)]
+                    return names[0] if len(names) == 1 and len(targets) == 1 else None
         return None
     unsafe_names = set()
     candidate_names = set()
@@ -334,12 +377,71 @@ if ceu_files:
             cid_name[c] = nm
             if nm:
                 candidate_names.add(nm)
+    trees = []
     for py in glob.glob(os.path.join(SRC, "sqlglot", "**", "*.py"), recursive=True) + \
               glob.glob(os.path.join(SRC, "tests", "**", "*.py"), recursive=True):
         try:
-            tree = ast.parse(open(py).read())
+            trees.append(ast.parse(open(py).read()))
         except Exception:
-            continue
+            sys.exit(f"REFUSING TO BUILD: cannot parse {py}")
+    defs_by_name: dict = {}
+    for tree in trees:
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                defs_by_name.setdefault(getattr(fn, "name", None), []).append(fn)
+    CAPS = re.compile(r"[A-Z][A-Z0-9_]*\Z").match
+
+    def param_only_in(fn, pname):
+        """True if parameter `pname` of fn is only ever read as the right side of in / not in."""
+        fpar = {}
+        for x in ast.walk(fn):
+            for ch_ in ast.iter_child_nodes(x):
+                fpar[ch_] = x
+        for x in ast.walk(fn):
+            if x is fn:
+                continue
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)) and \
+                    any(isinstance(y, ast.Name) and y.id == pname for y in ast.walk(x)):
+                return False  # nested scope mentions it: not analysed
+            if isinstance(x, ast.Name) and x.id == pname:
+                pp = fpar.get(x)
+                if not (isinstance(x.ctx, ast.Load) and isinstance(pp, ast.Compare) and x in pp.comparators
+                        and all(isinstance(op, (ast.In, ast.NotIn)) for op in pp.ops)):
+                    return False
+        return True
+
+    def passed_only_to_in(call, node):
+        """`node` is an argument of `call`: every function that could be called by that name
+        (anywhere in sqlglot or the tests) only uses the matching parameter with in / not in."""
+        f = call.func
+        name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
+        fns = defs_by_name.get(name) if name else None
+        if not fns or any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+            return False
+        for fn in fns:
+            a = fn.args
+            if a.vararg or a.kwarg:
+                return False
+            params = [x.arg for x in a.posonlyargs + a.args]
+            if isinstance(f, ast.Attribute):
+                if not params or params[0] not in ("self", "cls"):
+                    return False
+                params = params[1:]
+            if node in call.args:
+                i = call.args.index(node)
+                if i >= len(params):
+                    return False
+                pname = params[i]
+            else:
+                kw = next(k for k in call.keywords if k.value is node)
+                if kw.arg not in params + [x.arg for x in a.kwonlyargs]:
+                    return False
+                pname = kw.arg
+            if not param_only_in(fn, pname):
+                return False
+        return True
+
+    for tree in trees:
         parents = {}
         for node in ast.walk(tree):
             for ch_ in ast.iter_child_nodes(node):
@@ -358,24 +460,41 @@ if ceu_files:
                     up = parents[up]
                 stmt = parents.get(up)
                 if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and up is stmt.value and \
-                        isinstance(parents.get(stmt), (ast.Module, ast.ClassDef)) and up is not node:
+                        isinstance(parents.get(stmt), (ast.Module, ast.ClassDef)) and up is not node and \
+                        all(isinstance(t, ast.Name) for t in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target])):
                     ok = True
+                # inside a function: a display assigned to one ALL_CAPS attribute (tracked too)
+                if isinstance(stmt, ast.Assign) and up is stmt.value and up is not node and \
+                        isinstance(up, (ast.Set, ast.Dict, ast.BinOp)) and len(stmt.targets) == 1 and \
+                        isinstance(stmt.targets[0], ast.Attribute) and CAPS(stmt.targets[0].attr):
+                    ok = True
+            if not ok and isinstance(par, ast.Call) and (node in par.args or any(k.value is node for k in par.keywords)):
+                ok = passed_only_to_in(par, node)
             if not ok:
                 unsafe_names.add(nm)
 
+    for c, k in kind.items():  # names of in-function sets (not candidates above: cid_name only)
+        if k == "set" and c not in cid_name:
+            cid_name[c] = None
     narrowable = 0
     for c, k in kind.items():
-        if k == "set" and (cid_name.get(c) is None or cid_name[c] in unsafe_names):
-            continue
+        if c in infn:
+            continue  # built inside a function: followed as a copy, never narrowed itself
         cl = closure(c)
+        # every SET the entries flow into must be safe by name (Python copies sets internally)
+        if any(kind.get(x) == "set" and (cid_name.get(x) is None or cid_name[x] in unsafe_names) for x in cl):
+            continue
         whole = set().union(*(W.get(x, set()) for x in cl))
         if len(whole) == len(tests):
             continue  # used wholesale by every test: never narrowed
+        trie = set().union(*(T.get(x, set()) for x in cl)) - whole
         keys = set().union(*(A.get(x, {}).keys() for x in cl))
         acc = {key: sid(set().union(*(A.get(x, {}).get(key, set()) for x in cl))) for key in keys}
         rel, start, end = where[c]
         containers_out[c] = {"file": rel, "start": start, "end": end, "kind": k,
                              "entries": entries.get(c, []), "whole": sid(whole), "acc": acc}
+        if trie:
+            containers_out[c]["trie"] = sid(trie)
         narrowable += 1
     print(f"containers: {len(kind)} tracked, {narrowable} narrowable, set names unsafe: {len(unsafe_names)}",
           file=sys.stderr)
@@ -446,6 +565,7 @@ result = {
     "sets": [list(k) for k in sorted(set_ids, key=set_ids.get)],
     "files": files_out,
     "containers": containers_out,
+    "trie_plain_singles": TRIE_PLAIN_SINGLES if ceu_files else None,
     "cmp_files": cmp_files_out,
     "cmp_differ": cmp_differ_out,
     "bop_infected": bop_out,

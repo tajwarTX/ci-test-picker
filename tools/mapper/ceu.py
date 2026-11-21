@@ -30,6 +30,8 @@ TEST = os.environ.get("MAP_TEST", "")
 
 _acc: dict = {}      # cid -> set(canonical keys looked up)
 _whole: set = set()  # cids used wholesale
+_whole_at: dict = {}  # cid -> {(file, line)} of the Python frames that used it wholesale
+_infn: set = set()  # cids of displays inside functions (ALL_CAPS attribute assignments)
 _src: dict = {}      # cid -> set(source cids)
 _entries: dict = {}  # cid -> [[start, end, canon or None], ...]
 _kind: dict = {}     # cid -> "dict" | "set"
@@ -62,13 +64,20 @@ def _look(cid, key):
     c = canon(key)
     if c is None:
         _whole.add(cid)
+        _whole_at.setdefault(cid, set()).add(("?unnamed-key", 0))
     else:
         _acc.setdefault(cid, set()).add(c)
 
 
+def _mark_whole(cid):
+    _whole.add(cid)
+    f = sys._getframe(2)
+    _whole_at.setdefault(cid, set()).add((f.f_code.co_filename, f.f_lineno))
+
+
 def _wholesale(name):
     def method(self, *a, **k):
-        _whole.add(self._ceu_cid)
+        _mark_whole(self._ceu_cid)
         return getattr(self._ceu_base, name)(self, *a, **k)
 
     method.__name__ = name
@@ -100,7 +109,7 @@ class TrackedDict(dict):
         return dict.pop(self, k, *default)
 
     def __reduce_ex__(self, protocol):
-        _whole.add(self._ceu_cid)
+        _mark_whole(self._ceu_cid)
         return (_rebuild_dict, (self._ceu_cid, dict(dict.items(self))))
 
 
@@ -120,7 +129,7 @@ class TrackedSet(set):
         return set.__contains__(self, k)
 
     def __reduce_ex__(self, protocol):
-        _whole.add(self._ceu_cid)
+        _mark_whole(self._ceu_cid)
         return (_rebuild_set, (self._ceu_cid, list(set.__iter__(self))))
 
 
@@ -230,6 +239,12 @@ builtins.__ceu_binop__ = __ceu_binop__
 _BINOPS = {ast.BitOr: "|", ast.Sub: "-", ast.BitAnd: "&", ast.BitXor: "^"}
 
 
+import re as _re
+
+_CAPS = _re.compile(r"[A-Z][A-Z0-9_]*\Z").match
+_INFN_SITES: set = set()
+
+
 class _Rewriter(ast.NodeTransformer):
     def __init__(self, rel):
         self.rel = rel
@@ -284,6 +299,16 @@ class _Rewriter(ast.NodeTransformer):
 
     def visit_Module(self, node):
         self._assigns(node.body)
+        for fn in ast.walk(node):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for stmt in ast.walk(fn):
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and \
+                        isinstance(stmt.targets[0], ast.Attribute) and _CAPS(stmt.targets[0].attr):
+                    new = self.wrap(stmt.value)
+                    if new is not None:
+                        _INFN_SITES.add(self._cid(stmt.value))
+                        stmt.value = new
         return node
 
 
@@ -321,6 +346,8 @@ def dump():
         "test": TEST,
         "acc": {c: sorted(v) for c, v in _acc.items()},
         "whole": sorted(_whole),
+        "whole_at": {c: sorted(f"{os.path.relpath(fn, SRC)}:{ln}" for fn, ln in v) for c, v in _whole_at.items()},
+        "infn": sorted(_INFN_SITES & set(_kind)),
         "src": {c: sorted(v) for c, v in _src.items()},
         "entries": _entries,
         "kind": _kind,
