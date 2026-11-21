@@ -11,6 +11,42 @@ import os
 def start():
     parent = os.environ.get("MAP_PARENT_PID")
     test = os.environ.get("MAP_TEST")
+    if os.environ.get("MAP_MODE") == "cmp" and test:
+        # every process: profile comparison operators
+        import atexit
+
+        import cmpmap
+
+        cmpmap.install()
+        atexit.register(cmpmap.dump)
+        real_exit_m = os._exit
+
+        def _exit_cmp(code):
+            try:
+                cmpmap.dump()
+            finally:
+                real_exit_m(code)
+
+        os._exit = _exit_cmp
+        return
+    if os.environ.get("MAP_MODE") == "ceu" and test:
+        # every process (the pytest process and its workers): track containers
+        import atexit
+
+        import ceu
+
+        ceu.install()
+        atexit.register(ceu.dump)
+        real_exit_c = os._exit
+
+        def _exit_ceu(code):
+            try:
+                ceu.dump()
+            finally:
+                real_exit_c(code)
+
+        os._exit = _exit_ceu
+        return
     if not parent or not test or parent == str(os.getpid()):
         return
     import atexit

@@ -249,9 +249,162 @@ for rel, assigns in class_assigns.items():
     files_out[rel]["settings"] = out
     files_out[rel]["msettings"] = mout
 
+# ---- container-entry usage (ceu*.json) --------------------------------------------
+ceu_files = [f for run in run_dirs for f in glob.glob(os.path.join(run, "ceu*.json"))]
+containers_out = {}
+if ceu_files:
+    W: dict = {}
+    A: dict = {}
+    edges: dict = {}
+    kind, where, entries = {}, {}, {}
+    seen_tests = set()
+    for path in ceu_files:
+        d = json.load(open(path))
+        n = ctx_to_test(d["test"])
+        if n is None:
+            continue
+        seen_tests.add(n)
+        for c in d["whole"]:
+            W.setdefault(c, set()).add(n)
+        for c, keys in d["acc"].items():
+            per = A.setdefault(c, {})
+            for k in keys:
+                per.setdefault(k, set()).add(n)
+        for c, srcs in d["src"].items():
+            for s_ in srcs:
+                edges.setdefault(s_, set()).add(c)
+        kind.update(d["kind"])
+        where.update(d["where"])
+        for c, e in d["entries"].items():
+            entries.setdefault(c, e)
+    missing = [t["id"] for t in tests if t["number"] not in seen_tests]
+    if missing:
+        sys.exit(f"REFUSING TO BUILD: {len(missing)} tests have no container data, e.g. {missing[:3]}")
+
+    def closure(c):
+        out, todo = {c}, [c]
+        while todo:
+            for x in edges.get(todo.pop(), ()):
+                if x not in out:
+                    out.add(x)
+                    todo.append(x)
+        return out
+
+    # Sets: Python can copy a set internally (set(S), frozenset(S), x |= S, ...) without
+    # calling any tracked method, so a set is only narrowed when its NAME is used
+    # nowhere except as `... in NAME` / `... not in NAME` (or inside another tracked
+    # container display at class/module level).
+    set_names = {}
+    for c, k in kind.items():
+        if k == "set":
+            rel, line = where[c][0], where[c][1]
+            set_names.setdefault(rel, {})[line] = None
+    _parsed = {}
+
+    def assigned_name(rel, line):
+        if rel not in _parsed:
+            try:
+                _parsed[rel] = ast.parse(open(os.path.join(SRC, rel)).read())
+            except Exception:
+                _parsed[rel] = None
+        tree = _parsed[rel]
+        if tree is None:
+            return None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                if node.value.lineno <= line <= (node.value.end_lineno or node.value.lineno):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    names = [t.id for t in targets if isinstance(t, ast.Name)]
+                    return names[0] if len(names) == 1 else None
+        return None
+    unsafe_names = set()
+    candidate_names = set()
+    cid_name = {}
+    for c, k in kind.items():
+        if k == "set":
+            nm = assigned_name(where[c][0], where[c][1])
+            cid_name[c] = nm
+            if nm:
+                candidate_names.add(nm)
+    for py in glob.glob(os.path.join(SRC, "sqlglot", "**", "*.py"), recursive=True) + \
+              glob.glob(os.path.join(SRC, "tests", "**", "*.py"), recursive=True):
+        try:
+            tree = ast.parse(open(py).read())
+        except Exception:
+            continue
+        parents = {}
+        for node in ast.walk(tree):
+            for ch_ in ast.iter_child_nodes(node):
+                parents[ch_] = node
+        for node in ast.walk(tree):
+            nm = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+            if nm not in candidate_names or isinstance(getattr(node, "ctx", None), ast.Store):
+                continue
+            par = parents.get(node)
+            ok = isinstance(par, ast.Compare) and node in par.comparators and \
+                all(isinstance(op, (ast.In, ast.NotIn)) for op in par.ops)
+            if not ok:
+                # inside a class/module-level container display or | - & ^ of them
+                up = node
+                while up in parents and isinstance(parents[up], (ast.Set, ast.Dict, ast.BinOp, ast.Starred)):
+                    up = parents[up]
+                stmt = parents.get(up)
+                if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and up is stmt.value and \
+                        isinstance(parents.get(stmt), (ast.Module, ast.ClassDef)) and up is not node:
+                    ok = True
+            if not ok:
+                unsafe_names.add(nm)
+
+    narrowable = 0
+    for c, k in kind.items():
+        if k == "set" and (cid_name.get(c) is None or cid_name[c] in unsafe_names):
+            continue
+        cl = closure(c)
+        whole = set().union(*(W.get(x, set()) for x in cl))
+        if len(whole) == len(tests):
+            continue  # used wholesale by every test: never narrowed
+        keys = set().union(*(A.get(x, {}).keys() for x in cl))
+        acc = {key: sid(set().union(*(A.get(x, {}).get(key, set()) for x in cl))) for key in keys}
+        rel, start, end = where[c]
+        containers_out[c] = {"file": rel, "start": start, "end": end, "kind": k,
+                             "entries": entries.get(c, []), "whole": sid(whole), "acc": acc}
+        narrowable += 1
+    print(f"containers: {len(kind)} tracked, {narrowable} narrowable, set names unsafe: {len(unsafe_names)}",
+          file=sys.stderr)
+
+# ---- comparison-operator profile (cmp*.json) ----------------------------------------
+cmp_files_out, cmp_differ_out = [], {}
+cmp_paths = [f for run in run_dirs for f in glob.glob(os.path.join(run, "cmp.*.json"))]
+if cmp_paths:
+    seen_c = set()
+    differ: dict = {}
+    hit_files = set()
+    for path in cmp_paths:
+        d = json.load(open(path))
+        n = ctx_to_test(d["test"])
+        if n is None:
+            continue
+        seen_c.add(n)
+        for site in d["hit"]:
+            hit_files.add(site.rsplit(":", 2)[0])
+        for site, ops in d["differ"].items():
+            for op in ops:
+                differ.setdefault(site, {}).setdefault(op, set()).add(n)
+    missing = [t["id"] for t in tests if t["number"] not in seen_c]
+    if missing:
+        sys.exit(f"REFUSING TO BUILD: {len(missing)} tests have no comparison data, e.g. {missing[:3]}")
+    # every sqlglot module is loaded through the profiler, so every sqlglot file counts
+    cmp_files_out = sorted(r for r in line_tests if r.startswith("sqlglot/"))
+    cmp_differ_out = {site: {op: sid(ts) for op, ts in ops.items()} for site, ops in differ.items()}
+    print(f"comparisons: {len(differ)} sites ever disagree with a partner; files profiled {len(cmp_files_out)}",
+          file=sys.stderr)
+
 result = {
     "sets": [list(k) for k in sorted(set_ids, key=set_ids.get)],
     "files": files_out,
+    "containers": containers_out,
+    "cmp_files": cmp_files_out,
+    "cmp_differ": cmp_differ_out,
     # keep only real repository paths (the executor compiles generated code under
     # pseudo file names, which the open/compile recorder also sees)
     "opened": {p: sid(s) for p, s in sorted(opened.items()) if os.path.exists(os.path.join(SRC, p))},

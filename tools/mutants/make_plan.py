@@ -18,7 +18,7 @@ plan = {}
 for p in sorted(Path(sys.argv[2]).glob("*.patch")):
     text = p.read_text()
     chosen, why = sel.select(text)
-    if not any(k in " ".join(why) for k in ("class 1", "class 2", "setting 1", "setting 2")):
+    if not any(k in " ".join(why) for k in ("class 1", "class 2", "setting 1", "setting 2", "entry 1", "entry 2")):
         continue
     broad = set()
     for ch in S.parse_patch(text):

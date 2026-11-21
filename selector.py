@@ -11,6 +11,7 @@ For every patch:
 Then the chosen tests are split over the number of workers (1..8) that costs least.
 """
 
+import ast
 import gzip
 import json
 import os
@@ -181,6 +182,33 @@ def same_code(old: str, new: str) -> bool:
         return False
 
 
+def literal_canon(node):
+    """Same key names as the mapper uses, for keys written as literals."""
+    try:
+        v = ast.literal_eval(node)
+    except Exception:
+        return None
+
+    def c(v):
+        if v is None:
+            return "none"
+        if isinstance(v, str):
+            return "str:" + v
+        if isinstance(v, (bool, int, float)):
+            return "num:" + repr(float(v) if float(v) == v else v)
+        if isinstance(v, tuple):
+            parts = [c(x) for x in v]
+            return None if None in parts else "tuple:(" + ",".join(parts) + ")"
+        return None
+
+    return c(v)
+
+
+def touches_hash(ch) -> bool:
+    """Some changed line contains '#': a comment may be all that changed."""
+    return any(l[:1] in "+-" and "#" in l for _, body in ch.hunks for l in body)
+
+
 def maybe_comment_only(ch) -> bool:
     """Cheap pre-check before the (slow) token comparison. If the changed lines still
     differ after ignoring whitespace and lines that start with '#', the change touches
@@ -294,9 +322,154 @@ class Selector:
         self.opened = mp["opened"]
         self.stmt_cache: dict = {}
         self.import_check = import_check or ImportChecker()
+        self.containers = mp.get("containers", {})
+        self.container_index: dict = {}
+        for cid, c in self.containers.items():
+            self.container_index.setdefault(c["file"], []).append((c["start"], c["end"], cid))
+        self.ast_cache: dict = {}
+        self.dump_cache: dict = {}
+        self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
+        self.cmp_files = set(mp.get("cmp_files", ()))  # files whose comparisons were profiled
         # per commit
         self.patched: dict = {}
         self.fallback: set = set()
+
+    def container_at(self, path, p):
+        """Innermost tracked container whose braces strictly enclose line p."""
+        best = None
+        for start, end, cid in self.container_index.get(path, ()):
+            if start < p < end and (best is None or end - start < best[1] - best[0]):
+                best = (start, end, cid)
+        return best[2] if best else None
+
+    def container_change(self, path, original, new_text, cid, ch):
+        """Tests affected by the entry changes of one container, or None if unsure."""
+        info = self.containers[cid]
+        if info["kind"] not in ("dict", "set"):
+            return None
+        _, line, col = cid.rsplit(":", 2)
+        line, col = int(line), int(col)
+        try:
+            old_tree = self.ast_cache.get(path)
+            if old_tree is None:
+                old_tree = self.ast_cache[path] = ast.parse(original)
+            new_tree = ast.parse(new_text)
+        except SyntaxError:
+            return None
+        want = ast.Dict if info["kind"] == "dict" else ast.Set
+        delta = 0
+        for start, body in ch.hunks:  # lines added/removed before the container
+            if start < line:
+                plus = sum(1 for l in body if l[:1] == "+")
+                minus = sum(1 for l in body if l[:1] == "-")
+                if start + sum(1 for l in body if l[:1] != "+") <= line:
+                    delta += plus - minus
+                else:
+                    return None
+        find = lambda tree, ln: next((n for n in ast.walk(tree) if isinstance(n, want)
+                                      and n.lineno == ln and n.col_offset == col), None)
+        old_node, new_node = find(old_tree, line), find(new_tree, line + delta)
+        if old_node is None or new_node is None:
+            return None
+
+        def items(node, text):
+            seg = lambda n: ast.get_source_segment(text, n)
+            out = []
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    out.append(("u", seg(v), None) if k is None else ("k", seg(k), seg(v), k))
+            else:
+                for e in node.elts:
+                    out.append(("u", seg(e.value), None) if isinstance(e, ast.Starred) else ("k", seg(e), "", e))
+            return out
+
+        old_items, new_items = items(old_node, original), items(new_node, new_text)
+        if [i[1] for i in old_items if i[0] == "u"] != [i[1] for i in new_items if i[0] == "u"]:
+            return None  # what it is built from changed
+        old_explicit = [i for i in old_items if i[0] == "k"]
+        if len(old_explicit) != len(info["entries"]):
+            return None
+        key_canon = {}
+        old_pairs = []
+        for item, entry in zip(old_explicit, info["entries"]):
+            key_canon.setdefault(item[1], set()).add(entry[2])
+            old_pairs.append((entry[2], item[2]))
+        new_pairs = []
+        for item in (i for i in new_items if i[0] == "k"):
+            c = literal_canon(item[3])
+            if c is None:
+                known = key_canon.get(item[1])
+                c = next(iter(known)) if known and len(known) == 1 else None
+            new_pairs.append((c, item[2]))
+        from collections import Counter
+
+        diff = (Counter(old_pairs) - Counter(new_pairs)) + (Counter(new_pairs) - Counter(old_pairs))
+        changed = {k for k, _ in diff}
+        if None in changed:
+            return None
+        out = set(self.sets[info["whole"]])
+        for k in changed:
+            if k in info["acc"]:
+                out |= self.sets[info["acc"][k]]
+        return out
+
+    def same_tree(self, path, original, new_text) -> bool:
+        head = lambda t: [l for l in t.split("\n")[:2] if CODING.match(l)]
+        if head(original) != head(new_text):
+            return False
+        try:
+            old = self.dump_cache.get(path)
+            if old is None:
+                old = self.dump_cache[path] = ast.dump(ast.parse(original), include_attributes=False)
+            return old == ast.dump(ast.parse(new_text), include_attributes=False)
+        except Exception:
+            return False
+
+    CMP_PARTNERS = {
+        "Is": ("Eq",), "Eq": ("Is",), "IsNot": ("NotEq",), "NotEq": ("IsNot",),
+        "Lt": ("LtE", "Gt", "GtE"), "LtE": ("Lt", "Gt", "GtE"),
+        "Gt": ("GtE", "Lt", "LtE"), "GtE": ("Gt", "Lt", "LtE"),
+    }
+
+    def comparison_swaps(self, path, original, new_text, ch):
+        """[(site, new op)] if the ONLY difference is swapped operators in single-operator
+        comparisons that were profiled; otherwise None."""
+        if path not in self.cmp_files:
+            return None
+        ops_text = (" is ", "==", "!=", "<", ">")
+        if not any(l[:1] in "+-" and any(o in l for o in ops_text) for _, body in ch.hunks for l in body):
+            return None
+        try:
+            old_tree = self.ast_cache.get(path)
+            if old_tree is None:
+                old_tree = self.ast_cache[path] = ast.parse(original)
+            new_tree = ast.parse(new_text)
+        except SyntaxError:
+            return None
+        old_nodes, new_nodes = list(ast.walk(old_tree)), list(ast.walk(new_tree))
+        if len(old_nodes) != len(new_nodes):
+            return None
+        swaps, restore = [], []
+        for a, b in zip(old_nodes, new_nodes):
+            if isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop):
+                continue  # the operator objects themselves; checked on their Compare
+            if type(a) is not type(b):
+                return None
+            if isinstance(a, ast.Compare) and len(a.ops) == len(b.ops) == 1 \
+                    and type(a.ops[0]) is not type(b.ops[0]):
+                old_op, new_op = type(a.ops[0]).__name__, type(b.ops[0]).__name__
+                if new_op not in self.CMP_PARTNERS.get(old_op, ()):
+                    return None
+                swaps.append((f"{path}:{a.lineno}:{a.col_offset}", new_op))
+                restore.append((b, b.ops))
+                b.ops = a.ops
+        if not swaps:
+            return None
+        same = self.dump_cache.get(path)
+        if same is None:
+            same = self.dump_cache[path] = ast.dump(old_tree, include_attributes=False)
+        equal = same == ast.dump(new_tree, include_attributes=False)
+        return swaps if equal else None
 
     def whole_file(self, path):
         info = self.files.get(path)
@@ -321,9 +494,26 @@ class Selector:
         if maybe_comment_only(ch) and same_code(original, new_text):
             why.append(f"{path}: only comments/blank lines/spacing changed -> none")
             return set()
+        if touches_hash(ch) and self.same_tree(path, original, new_text):
+            # e.g. a comment edited at the end of a code line: Python builds exactly the
+            # same program (only line numbers can differ)
+            why.append(f"{path}: same syntax tree (comment/format edit) -> none")
+            return set()
         if info is None:
             why.append(f"{path}: never run by any test -> none")
             return set()
+        swaps = self.comparison_swaps(path, original, new_text, ch)
+        if swaps is not None:
+            # Only comparison operators were swapped (e.g. `is` -> `==`). A test is
+            # affected only if, at one of these comparisons, the two operators gave
+            # different answers on the values that test actually compared.
+            out = set()
+            for site, new_op in swaps:
+                sid_ = self.cmp_differ.get(site, {}).get(new_op)
+                if sid_ is not None:
+                    out |= self.sets[sid_]
+            why.append(f"{path}: comparison swap at {len(swaps)} site(s) -> tests where they disagree")
+            return out
         chosen = set()
         funcs = info["funcs"]
         stmts = self.stmt_cache.get(path)
@@ -334,55 +524,68 @@ class Selector:
         if path.startswith("sqlglot/"):
             self.patched[path] = new_text
         kinds = []
+
+        def import_time(p):
+            """A point outside any function body (module level, class body, decorators,
+            signatures): all of it runs when the module is imported."""
+            out = set()
+            # Outside any function body: module level, class body, decorators,
+            # signatures. All of it runs at import time.
+            cls = None
+            if path.startswith("sqlglot/"):
+                for start, body, end, s in info.get("classes", []):
+                    if body <= p <= end and (cls is None or end - body < cls[1] - cls[0]):
+                        cls = (body, end, s)
+            setting = None
+            for start, end, s in info.get("settings", []):
+                if start <= p <= end:
+                    setting = s
+            if cls is not None and cls[2] >= 0 and setting is not None:
+                # An UPPER_CASE class setting: tests that used this class (or a
+                # subclass) AND ran a line that reads the setting by name.
+                out |= self.sets[cls[2]] & self.sets[setting]
+                self.fallback |= self.whole_file(path)
+                kinds.append("setting")
+            elif cls is not None and cls[2] >= 0:
+                # Class body / method header: tests that used this class (or a
+                # subclass), plus tests that ran a method whose header this is.
+                out |= self.sets[cls[2]]
+                for start, body, end, s in funcs:
+                    if start <= p < body:
+                        out |= self.sets[s]
+                # ...but only if the patched package still imports (checked once
+                # per commit); otherwise everything that loads this file.
+                self.fallback |= self.whole_file(path)
+                kinds.append("class")
+            else:
+                msetting = None
+                if cls is None and path.startswith("sqlglot/"):
+                    for start, end, s in info.get("msettings", []):
+                        if start <= p <= end:
+                            msetting = s
+                if msetting is not None:
+                    # An UPPER_CASE module constant: tests that loaded this file AND
+                    # ran a line that reads the constant by name (import-checked).
+                    out |= self.whole_file(path) & self.sets[msetting]
+                    self.fallback |= self.whole_file(path)
+                    kinds.append("setting")
+                else:
+                    out |= self.whole_file(path)
+                    kinds.append("file")
+            return out
+
+        container_points: dict = {}
         for p in ch.points:
             best = None
             for start, body, end, s in funcs:
                 if body <= p <= end and (best is None or end - body < best[1] - best[0]):
                     best = (body, end, s)
             if best is None:
-                # Outside any function body: module level, class body, decorators,
-                # signatures. All of it runs at import time.
-                cls = None
-                if path.startswith("sqlglot/"):
-                    for start, body, end, s in info.get("classes", []):
-                        if body <= p <= end and (cls is None or end - body < cls[1] - cls[0]):
-                            cls = (body, end, s)
-                setting = None
-                for start, end, s in info.get("settings", []):
-                    if start <= p <= end:
-                        setting = s
-                if cls is not None and cls[2] >= 0 and setting is not None:
-                    # An UPPER_CASE class setting: tests that used this class (or a
-                    # subclass) AND ran a line that reads the setting by name.
-                    chosen |= self.sets[cls[2]] & self.sets[setting]
-                    self.fallback |= self.whole_file(path)
-                    kinds.append("setting")
-                elif cls is not None and cls[2] >= 0:
-                    # Class body / method header: tests that used this class (or a
-                    # subclass), plus tests that ran a method whose header this is.
-                    chosen |= self.sets[cls[2]]
-                    for start, body, end, s in funcs:
-                        if start <= p < body:
-                            chosen |= self.sets[s]
-                    # ...but only if the patched package still imports (checked once
-                    # per commit); otherwise everything that loads this file.
-                    self.fallback |= self.whole_file(path)
-                    kinds.append("class")
+                cid = self.container_at(path, p)
+                if cid is not None:
+                    container_points.setdefault(cid, []).append(p)
                 else:
-                    msetting = None
-                    if cls is None and path.startswith("sqlglot/"):
-                        for start, end, s in info.get("msettings", []):
-                            if start <= p <= end:
-                                msetting = s
-                    if msetting is not None:
-                        # An UPPER_CASE module constant: tests that loaded this file AND
-                        # ran a line that reads the constant by name (import-checked).
-                        chosen |= self.whole_file(path) & self.sets[msetting]
-                        self.fallback |= self.whole_file(path)
-                        kinds.append("setting")
-                    else:
-                        chosen |= self.whole_file(path)
-                        kinds.append("file")
+                    chosen |= import_time(p)
             elif multi.get(p, p) in stmt_set:
                 # an executable statement: only tests that actually ran it can notice
                 chosen |= self.sets[stmt_set[multi.get(p, p)]]
@@ -391,8 +594,22 @@ class Selector:
                 # blank/comment/else:/docstring line inside a function: whole function
                 chosen |= self.sets[best[2]]
                 kinds.append("func")
+        for cid, pts in container_points.items():
+            base = set()
+            for p in pts:
+                base |= import_time(p)  # class / setting / file rule (always sound)
+            got = self.container_change(path, original, new_text, cid, ch)
+            if got is not None:
+                # Entries of a settings dict/set: tests that looked up a changed key (in
+                # it or any copy of it) or used it wholesale. Both this and the class rule
+                # contain every affected test, so their intersection does too.
+                chosen |= got & base
+                kinds.append("entry")
+            else:
+                chosen |= base
         why.append(f"{path}: points stmt {kinds.count('stmt')}, func {kinds.count('func')}, "
-                   f"class {kinds.count('class')}, setting {kinds.count('setting')}, file {kinds.count('file')}")
+                   f"class {kinds.count('class')}, setting {kinds.count('setting')}, entry {kinds.count('entry')}, "
+                   f"file {kinds.count('file')}")
         return chosen
 
     def select_other(self, path: str, why: list) -> set:
