@@ -39,6 +39,7 @@ class Result(unittest.TestResult):
     def __init__(self):
         super().__init__()
         self.bad = set()
+        self.capped = False
 
     def _id(self, test):
         return getattr(test, "_br_id", None) or getattr(getattr(test, "test_case", None), "_br_id", None)
@@ -47,6 +48,9 @@ class Result(unittest.TestResult):
         self.bad.add(self._id(test))
 
     def addError(self, test, err):
+        if err and err[0] is not None and err[0].__name__ == "_CapReached":
+            self.capped = True  # interrupted by the CPU cap: not a verdict
+            return
         self.bad.add(self._id(test) or "<class setup>")
 
     def addSubTest(self, test, subtest, err):
@@ -181,7 +185,142 @@ def serve():
         sys.stdout.flush()
 
 
+# ---------------------------------------------------------------- v14: fork for every commit
+def _overlay(files):
+    """Serve patched data files (fixtures) from memory for exactly those paths."""
+    import builtins
+    import io
+
+    real = io.open
+
+    def opener(file, mode="r", *args, **kwargs):
+        try:
+            key = os.path.abspath(os.fspath(file))
+        except TypeError:
+            key = None
+        if key in files and not any(c in mode for c in "wax+"):
+            return io.BytesIO(files[key].encode("utf-8")) if "b" in mode else io.StringIO(files[key])
+        return real(file, mode, *args, **kwargs)
+
+    builtins.open = opener
+    io.open = opener
+
+
+class _CapReached(BaseException):
+    pass
+
+
+def _run_verdicts(ids, cap):
+    """Run tests class by class in the given order; per-test verdicts. Stops at the first
+    failing test, or when this process has used `cap` CPU seconds (a CPU timer interrupts
+    a running test then); everything not finished is 'unrun' (the caller keeps it)."""
+    import signal
+    import time
+    t0 = time.process_time()
+
+    def on_cap(signum, frame):
+        raise _CapReached()
+
+    signal.signal(signal.SIGPROF, on_cap)
+    signal.setitimer(signal.ITIMER_PROF, max(cap, 0.01))
+    failed, unrun, suites, order = set(), [], {}, []
+    for tid in ids:
+        path, cls, meth = tid.split("::")
+        mod = path[:-3].replace("/", ".")
+        try:
+            case = getattr(importlib.import_module(mod), cls)(meth)
+        except BaseException:  # noqa: BLE001  file/class does not load: the test fails
+            failed.add(tid)
+            continue
+        case._br_id = tid
+        key = (mod, cls)
+        if key not in suites:
+            suites[key] = []
+            order.append(key)
+        suites[key].append(case)
+    stopped = bool(failed)
+    for key in order:
+        cases = suites[key]
+        if stopped or time.process_time() - t0 > cap:
+            unrun += [c._br_id for c in cases]
+            continue
+        res = Result()
+        try:
+            unittest.TestSuite(cases).run(res)
+        except _CapReached:
+            unrun += [c._br_id for c in cases]  # interrupted: nothing of this class counts
+            stopped = True
+            continue
+        if res.capped:
+            unrun += [c._br_id for c in cases]  # the timer fired inside this class: no verdicts
+            stopped = True
+            continue
+        if "<class setup>" in res.bad or None in res.bad:
+            failed.update(c._br_id for c in cases)
+        failed.update(t for t in res.bad if t and t != "<class setup>")
+        if failed:
+            stopped = True  # first failure: the rest stays listed unrun
+    signal.setitimer(signal.ITIMER_PROF, 0)
+    return {"failed": sorted(failed), "unrun": sorted(unrun), "ran": len(ids)}
+
+
+def serve_all(test_files):
+    """Warm parent: pristine sqlglot + every test module imported once. Per request, fork a
+    child that applies the patch (code swap, or a re-import of sqlglot and the tests from
+    the patched tree in /tmp/ic), overlays fixtures, and runs the candidates."""
+    os.environ["SKIP_INTEGRATION"] = "0"
+    cf.ProcessPoolExecutor = SyncExecutor
+    import concurrent.futures.process as cfp
+    cfp.ProcessPoolExecutor = SyncExecutor
+    sys.path.append(SRC)
+    import sqlglot  # noqa: F401  (pristine)
+    for f in test_files:
+        try:
+            importlib.import_module(f[:-3].replace("/", "."))
+        except BaseException:  # noqa: BLE001
+            pass
+    sys.stdout.write("READY\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        req = json.loads(line)
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            out = os.fdopen(w, "w")
+            try:
+                if req.get("reimport"):
+                    for name in [m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot.")
+                                 or m == "tests" or m.startswith("tests.")]:
+                        del sys.modules[name]
+                    sys.path.insert(0, req["reimport"])
+                    importlib.invalidate_caches()
+                    import sqlglot  # noqa: F401,F811  (patched)
+                else:
+                    if not all(_swap(rel, d["text"], d["functions"]) for rel, d in req["swap"].items()):
+                        raise RuntimeError("noswap")
+                fx = {os.path.join(SRC, rel): text for rel, text in req.get("fixtures", {}).items()}
+                if fx:
+                    _overlay(fx)
+                import io, contextlib
+                with contextlib.redirect_stdout(io.StringIO()):
+                    res = _run_verdicts(req["ids"], req["cap"])
+                out.write(json.dumps(res))
+            except BaseException:  # noqa: BLE001
+                out.write(json.dumps({"error": True}))
+            out.flush()
+            os._exit(0)
+        os.close(w)
+        data = os.fdopen(r).read()
+        os.waitpid(pid, 0)
+        sys.stdout.write((data.strip() or json.dumps({"error": True})) + "\n")
+        sys.stdout.flush()
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--serve-all"]:
+        serve_all(sys.argv[2:])
+        sys.exit(0)
     if sys.argv[1:2] == ["--serve"]:
         serve()
         sys.exit(0)

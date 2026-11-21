@@ -628,6 +628,7 @@ class Selector:
         self.test_ids = {t["number"]: t["id"] for t in tests}
         self._imp = None
         self._server = None
+        self._srv_all = None
         self._changes = {}
         self.whole_tests = {t["number"]: t["id"] for t in tests if t["id"] in self.WHOLE} \
             if tpc_probe is not None else {}
@@ -1380,6 +1381,114 @@ class Selector:
             self._server = False
             return None
 
+    GIANTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+              "tests/test_parser.py::TestParser::test_max_nodes")
+    V14_WALL = 130.0  # no new runs after this many seconds of the whole run
+
+    def _all_server(self):
+        if self._srv_all is None:
+            files = sorted({i.split("::")[0] for i in self.test_ids.values()})
+            env = dict(os.environ, PYTHONPATH=str(SRC), PYTHONDONTWRITEBYTECODE="1", PYTHONHASHSEED="0",
+                       TPC_SRC=str(SRC))
+            srv = subprocess.Popen([sys.executable, str(APP / "runner.py"), "--serve-all", *files], cwd="/tmp",
+                                   env=env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+            import select as _select
+            ready, _, _ = _select.select([srv.stdout], [], [], 120)
+            if not ready or srv.stdout.readline().strip() != "READY":
+                srv.kill()
+                self._srv_all = False
+            else:
+                self._srv_all = srv
+        return self._srv_all or None
+
+    def verify_all(self, patch_text, chosen, why):
+        """Fork a child of the warm parent, apply the patch in memory, run the candidate
+        tests cheapest first (stopping once the CPU spent exceeds what can still be
+        saved) and list only the tests that failed or were not run. Giants keep the
+        static decision. Anything unexpected keeps the static list."""
+        if self.tpc_probe is None or time.monotonic() - START > self.V14_WALL:
+            return chosen
+        giants = {n for n in chosen if self.test_ids[n] in self.GIANTS}
+        cand = sorted(chosen - giants, key=lambda n: (self.durations[n], n))
+        if not cand:
+            return chosen
+        full = cost_of(split(chosen, self.durations), self.durations)
+        floor = cost_of(split(giants, self.durations), self.durations)
+        if full - floor < 1.0:
+            return chosen
+        try:
+            changes = parse_patch(patch_text)
+        except Exception:
+            return chosen
+        self._changes = {c.old: c for c in changes if c.old}
+        patched, fixtures = {}, {}
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return chosen
+            src = SRC / ch.old
+            if not src.exists():
+                return chosen
+            new_text = rebuild(src.read_text(), ch.hunks)
+            if new_text is None:
+                return chosen
+            if ch.old.startswith("sqlglot/") and ch.old.endswith(".py"):
+                patched[ch.old] = new_text
+            elif ch.old.startswith("tests/fixtures/") and not ch.old.endswith((".py", ".gz")):
+                fixtures[ch.old] = new_text
+            else:
+                return chosen  # test code or other files: keep the static answer
+        plan = self._swap_plan(patched) if patched else {}
+        reimport = plan is None or (patched and set(plan) != {r for r, t in patched.items()
+                                                             if not same_code((SRC / r).read_text(), t)})
+        overhead = 0.8 if reimport else 0.05
+        cap = full - floor - 0.5 - overhead
+        if cap <= 0.2:
+            return chosen
+        srv = self._all_server()
+        if srv is None:
+            return chosen
+        checker = self.tpc_probe.checker
+        saved = {}
+        try:
+            if reimport:
+                if not checker.ready:
+                    checker._setup()
+                for rel, text in patched.items():
+                    f = checker.work / rel
+                    st = f.stat()
+                    saved[rel] = (f.read_bytes(), st.st_atime_ns, st.st_mtime_ns)
+                    f.write_text(text)
+            req = {"ids": [self.test_ids[n] for n in cand], "cap": cap, "fixtures": fixtures,
+                   "reimport": str(checker.work) if reimport else None, "swap": {} if reimport else plan}
+            srv.stdin.write(json.dumps(req) + "\n")
+            srv.stdin.flush()
+            import select as _select
+            ready, _, _ = _select.select([srv.stdout], [], [], max(30.0, 3 * cap))
+            if not ready:
+                raise TimeoutError
+            res = json.loads(srv.stdout.readline())
+            if res.get("error") or res.get("ran") != len(cand):
+                return chosen
+            bad = set(res["failed"]) | set(res["unrun"])
+            assert bad <= {self.test_ids[n] for n in cand}
+        except Exception:
+            try:
+                srv.kill()
+            except Exception:
+                pass
+            self._srv_all = False
+            return chosen
+        finally:
+            for rel, (data, atime, mtime) in saved.items():
+                f = checker.work / rel
+                f.write_bytes(data)
+                os.utime(f, ns=(atime, mtime))
+        keep = giants | {n for n in cand if self.test_ids[n] in bad}
+        why.append(f"ran {len(cand) - len(res['unrun'])} of {len(cand)} here ({'re-import' if reimport else 'swap'}): "
+                   f"{len(res['failed'])} fail, {len(res['unrun'])} not run -> list {len(keep)}")
+        return keep
+
     def _heavy_module(self, path):
         cache = self.__dict__.setdefault("_heavy_cache", {})
         if path not in cache:
@@ -1671,7 +1780,7 @@ def main() -> None:
                 chosen, why = all_numbers, [f"selector error {e!r} -> ALL"]
         chosen = {n for n in chosen if n in durations}
         if sel is not None and chosen:
-            chosen = sel.verify_by_running(patch_text, chosen, why)
+            chosen = sel.verify_all(patch_text, chosen, why)
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
