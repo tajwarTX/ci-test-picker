@@ -15,6 +15,22 @@ def start():
         return
     import atexit
 
+    if os.environ.get("MAP_MODE") == "opens":
+        import opens_plugin
+
+        opens_plugin.install()
+        atexit.register(opens_plugin.dump)
+        real_exit_o = os._exit
+
+        def _exit_opens(code):
+            try:
+                opens_plugin.dump()
+            finally:
+                real_exit_o(code)
+
+        os._exit = _exit_opens
+        return
+
     if os.environ.get("MAP_MODE") == "usage":
         import class_usage
 

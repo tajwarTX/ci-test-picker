@@ -252,7 +252,9 @@ for rel, assigns in class_assigns.items():
 result = {
     "sets": [list(k) for k in sorted(set_ids, key=set_ids.get)],
     "files": files_out,
-    "opened": {p: sid(s) for p, s in sorted(opened.items())},
+    # keep only real repository paths (the executor compiles generated code under
+    # pseudo file names, which the open/compile recorder also sees)
+    "opened": {p: sid(s) for p, s in sorted(opened.items()) if os.path.exists(os.path.join(SRC, p))},
 }
 with gzip.open(out_path, "wt") as f:
     json.dump(result, f, separators=(",", ":"))

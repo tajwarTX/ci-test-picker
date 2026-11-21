@@ -244,6 +244,34 @@ class ImportChecker:
                 os.utime(f, ns=(atime, mtime))
 
 
+PYTEST_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
+PYTEST_SECTION_FILES = {"pyproject.toml", "setup.cfg"}
+
+
+def touches_pytest_config(ch, path) -> bool:
+    """pytest reads conftest.py, pytest.ini, tox.ini and the [tool.pytest...] /
+    [tool:pytest] sections of pyproject.toml / setup.cfg before any test runs, so a change
+    there can affect every test."""
+    name = path.rsplit("/", 1)[-1]
+    if name in PYTEST_FILES:
+        return True
+    if name not in PYTEST_SECTION_FILES:
+        return False
+    for _, body in ch.hunks:
+        if any("pytest" in l.lower() for l in body):
+            return True
+    original = SRC / path
+    if not original.exists():
+        return True  # cannot tell which section changed
+    section = ""
+    sections = {}
+    for i, line in enumerate(original.read_text(errors="replace").split("\n"), 1):
+        if line.strip().startswith("["):
+            section = line.strip().lower()
+        sections[i] = section
+    return any("pytest" in sections.get(p, "") for p in ch.points)
+
+
 class LazySets:
     """Turns a stored test list into a set only when a commit needs it."""
 
@@ -397,14 +425,25 @@ class Selector:
                 why.append("binary change -> ALL")
             elif ch.old is None or ch.new is None or ch.old != ch.new:
                 path = ch.new or ch.old
-                if path.endswith(".py") or path.startswith(("sqlglot/", "tests/")):
+                names = [p for p in (ch.old, ch.new) if p]
+                if any(p.endswith(".py") or p.startswith(("sqlglot/", "tests/"))
+                       or p.rsplit("/", 1)[-1] in PYTEST_FILES | PYTEST_SECTION_FILES for p in names):
                     why.append(f"{ch.old} -> {ch.new}: add/delete/rename -> ALL")
                     chosen |= self.all
                 else:
                     chosen |= self.select_other(path, why)
-            elif ch.old.endswith(".py"):
+            elif touches_pytest_config(ch, ch.old):
+                why.append(f"{ch.old}: pytest configuration -> ALL")
+                chosen |= self.all
+            elif ch.old.endswith(".py") and ch.old.startswith(("sqlglot/", "tests/")):
                 chosen |= self.select_py(ch, ch.old, why)
+            elif ch.old.endswith(".py") and "/" not in ch.old:
+                # the repository root is on sys.path: a root module can shadow others
+                why.append(f"{ch.old}: Python file at the repository root -> ALL")
+                chosen |= self.all
             else:
+                # other files, including Python files outside sqlglot/ and tests/ (e.g.
+                # sqlglotc/setup.py): the tests recorded opening, running or listing them
                 chosen |= self.select_other(ch.old, why)
         if self.fallback - chosen:
             if self.import_check(self.patched):
