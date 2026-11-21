@@ -1327,6 +1327,7 @@ def split(numbers, durations):
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    tests_by_num = {t["number"]: t["id"] for t in tests}
     all_numbers = set(durations)
     try:
         if MAP_PICKLE.exists():
@@ -1350,6 +1351,9 @@ def main() -> None:
             except Exception as e:
                 chosen, why = all_numbers, [f"selector error {e!r} -> ALL"]
         chosen = {n for n in chosen if n in durations}
+        # DIAGNOSTIC BUILD ONLY (branch diag-no-maxnodes): never run test_max_nodes, to
+        # measure its waste on the practice set. NOT a final candidate.
+        chosen -= {n for n in chosen if tests_by_num[n] == "tests/test_parser.py::TestParser::test_max_nodes"}
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
