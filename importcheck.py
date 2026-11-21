@@ -50,8 +50,16 @@ def check(baseline_path, changed):
     loads = json.load(open(baseline_path))["loads"]
     changed = set(changed)
     targets = [m for m, l in sorted(loads.items()) if changed & set(l)]
+    failed = []
     for name in targets:
-        importlib.import_module(name)  # any exception -> non-zero exit
+        try:
+            importlib.import_module(name)
+        except BaseException:
+            failed.append(name)
+    if failed:
+        # the modules that do not import (a module importing a broken one fails too)
+        print(json.dumps(failed))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

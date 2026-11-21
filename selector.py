@@ -281,7 +281,9 @@ class ImportChecker:
         self.ready = True
 
     def __call__(self, patched: dict) -> bool:
-        """patched: {"sqlglot/x.py": new text}. True only if every module imports."""
+        """patched: {"sqlglot/x.py": new text}. True only if every module imports.
+        Afterwards self.failed lists the modules that did not import, or is None if unknown."""
+        self.failed = None
         if not self.module_list.exists():
             return False
         if not self.ready:
@@ -297,9 +299,17 @@ class ImportChecker:
             mods = [rel[:-3].replace("/", ".").removesuffix(".__init__") for rel in patched]
             proc = subprocess.run(
                 [sys.executable, str(APP / "importcheck.py"), str(self.module_list), *mods],
-                cwd="/tmp", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=60,
+                cwd="/tmp", env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=60, text=True,
             )
+            self.failed = None
+            if proc.returncode != 0:
+                try:
+                    got = json.loads(proc.stdout.strip().splitlines()[-1])
+                    if isinstance(got, list) and got and all(isinstance(m, str) for m in got):
+                        self.failed = got
+                except Exception:
+                    self.failed = None
             return proc.returncode == 0
         except Exception:
             return False
@@ -1146,14 +1156,39 @@ class Selector:
             if self.import_check(self.patched):
                 why.append("class-level change: patched package imports OK")
             else:
-                why.append("class-level change: import check FAILED -> whole file")
-                chosen |= self.fallback
+                narrowed = self.loaders_of(getattr(self.import_check, "failed", None))
+                if narrowed is not None:
+                    # only tests that load a module that no longer imports can be broken
+                    # by the failure itself; the rules above covered the change otherwise
+                    why.append(f"class-level change: import check FAILED -> tests loading {len(self.import_check.failed)} failing module(s)")
+                    chosen |= narrowed
+                else:
+                    why.append("class-level change: import check FAILED -> whole file")
+                    chosen |= self.fallback
                 return chosen, why  # never probe a package that does not import
         if self.tpc is not None and self.tpc in chosen:
             self.try_tpc_probe(changes, chosen, why)
         if self.max_test is not None and self.max_test in chosen:
             self.try_max_probe(changes, chosen, why)
         return chosen, why
+
+    def loaders_of(self, modules):
+        """Tests whose process loaded (ran any line of) one of these modules; None if any
+        module cannot be mapped to a known file (then the caller keeps the whole file)."""
+        if not modules:
+            return None
+        out = set()
+        for m in modules:
+            if not m.startswith("sqlglot"):
+                return None
+            base = m.replace(".", "/")
+            for rel in (base + ".py", base + "/__init__.py"):
+                if rel in self.files:
+                    out |= self.sets[self.files[rel]["all"]]
+                    break
+            else:
+                return None
+        return out
 
     def try_max_probe(self, changes, chosen, why):
         """Drop test_max_nodes when the change touches no line its two huge parses (or the
