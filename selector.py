@@ -426,6 +426,19 @@ def _run_patched(checker, patched, args, timeout):
             os.utime(f, ns=(atime, mtime))
 
 
+def _innermost_stmt(stmts, p):
+    """The innermost statement (any level) whose lines contain p, or None."""
+    for s in stmts:
+        if (s.lineno <= p <= (s.end_lineno or s.lineno)) or \
+                (getattr(s, "decorator_list", None) and s.decorator_list[0].lineno <= p < s.lineno):
+            for block in _blocks(s):
+                inner = _innermost_stmt(block, p)
+                if inner is not None:
+                    return inner
+            return s
+    return None
+
+
 def _blocks(s):
     for name in ("body", "orelse", "finalbody"):
         b = getattr(s, name, None)
@@ -560,6 +573,9 @@ class Selector:
         mx = [t["number"] for t in tests if t["id"] == "tests/test_parser.py::TestParser::test_max_nodes"]
         self.max_test = mx[0] if mx and tpc_probe is not None else None
         self._max_map = None
+        self._grpa_map = None
+        self.whole_tests = {t["number"]: t["id"] for t in tests if t["id"] in self.WHOLE} \
+            if tpc_probe is not None else {}
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
         self.cmp_files = set(mp.get("cmp_files", ()))  # files whose comparisons were profiled
         # site -> tests where and/or swapped could differ. Only maps from the side-effect-aware
@@ -1170,7 +1186,116 @@ class Selector:
             self.try_tpc_probe(changes, chosen, why)
         if self.max_test is not None and self.max_test in chosen:
             self.try_max_probe(changes, chosen, why)
+        if self.tpc_probe is not None and chosen & self.whole_tests.keys():
+            self.try_whole_probes(changes, chosen, why)
         return chosen, why
+
+    # tests whose WHOLE sqlglot part a probe can re-run cheaply on the patched code:
+    # number -> (probe kind, mode, estimated CPU seconds)
+    WHOLE = {"tests/test_executor.py::TestExecutor::test_execute_tpch": ("tpch", "exec"),
+             "tests/test_executor.py::TestExecutor::test_optimized_tpch": ("tpch", "opt"),
+             "tests/test_generator.py::TestGenerator::test_generator_memory": ("genmem", None)}
+    WHOLE_COST = {"tpch": 1.0, "genmem": 2.5}  # measured 0.73 s / 2.06 s CPU, plus margin
+
+    def try_whole_probes(self, changes, chosen, why):
+        """Drop TPC-H / generator-memory tests when re-running their whole sqlglot part on
+        the patched code (fresh process, patched package imported) gives the pristine
+        results. Only when every changed line the real test runs is also run by the check
+        (grpa_map: lines the real test runs that the check does not)."""
+        m = self.grpa_map()
+        if not m:
+            return
+        got = self._whole_inputs(changes, chosen & self.whole_tests.keys())
+        if got is None:
+            return
+        patched, ranges = got
+        eligible = []
+        for n in chosen & self.whole_tests.keys():
+            unm = m.get(self.whole_tests[n], {})
+            if not any(l in unm.get(rel, ()) for rel, lo, hi in ranges for l in range(lo, hi + 1)):
+                eligible.append(n)
+        kinds = {}
+        for n in eligible:
+            kinds.setdefault(self.WHOLE[self.whole_tests[n]][0], set()).add(n)
+        best, best_net = None, 1.0
+        for combo in (("tpch",), ("genmem",), ("tpch", "genmem")):
+            if not all(k in kinds for k in combo):
+                continue
+            drop = set().union(*(kinds[k] for k in combo))
+            saving = cost_of(split(chosen, self.durations), self.durations) - \
+                cost_of(split(chosen - drop, self.durations), self.durations)
+            net = saving - sum(self.WHOLE_COST[k] for k in combo)
+            if net > best_net:
+                best, best_net = combo, net
+        if best is None:
+            return
+        for k in best:
+            tests = kinds[k]
+            if k == "tpch":
+                modes = sorted({self.WHOLE[self.whole_tests[n]][1] for n in tests})
+                ok = _run_patched(self.tpc_probe.checker, patched, ["tpch", str(self.tpc_probe.data), *modes], 60)
+            else:
+                ok = _run_patched(self.tpc_probe.checker, patched, ["genmem"], 60)
+            names = ", ".join(sorted(self.whole_tests[n].split("::")[-1] for n in tests))
+            if ok:
+                chosen -= tests
+                why.append(f"whole-test check passes on the patched code -> drop {names}")
+            else:
+                why.append(f"whole-test check fails -> keep {names}")
+
+    def _whole_inputs(self, changes, tests):
+        """(patched sqlglot files, line ranges of the innermost statements holding the
+        changed points, at any level) or None when the change is not of that kind."""
+        patched, ranges = {}, []
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return None
+            path = ch.old
+            if not path.endswith(".py"):
+                if path.rsplit("/", 1)[-1] in PYTEST_FILES | PYTEST_SECTION_FILES:
+                    return None
+                sid_ = self.opened.get(path)
+                if sid_ is None and path.startswith(("sqlglot/", "tests/")):
+                    return None
+                if sid_ is not None and self.sets[sid_] & tests:
+                    return None
+                continue
+            if not path.startswith("sqlglot/"):
+                return None  # test code / helpers / root modules: not handled here
+            src = SRC / path
+            if not src.exists():
+                return None
+            original = src.read_text()
+            new_text = rebuild(original, ch.hunks)
+            if new_text is None:
+                return None
+            try:
+                compile(new_text, path, "exec")
+                tree = self.ast_cache.get(path)
+                if tree is None:
+                    tree = self.ast_cache[path] = ast.parse(original)
+            except Exception:
+                return None
+            patched[path] = new_text
+            if same_code(original, new_text):
+                continue
+            if not ch.points:
+                return None
+            for p in sorted(ch.points):
+                node = _innermost_stmt(tree.body, p)
+                if node is None:
+                    return None
+                ranges.append((path, node.lineno, node.end_lineno or node.lineno))
+        return patched, ranges
+
+    def grpa_map(self):
+        if self._grpa_map is None:
+            try:
+                m = json.load(gzip.open(APP / "grpa_map.json.gz", "rt"))
+                self._grpa_map = {t: {r: set(v) for r, v in d.items()} for t, d in m.items()}
+            except Exception:
+                self._grpa_map = False
+        return self._grpa_map
 
     def loaders_of(self, modules):
         """Tests whose process loaded (ran any line of) one of these modules; None if any

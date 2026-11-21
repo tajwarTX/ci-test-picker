@@ -153,6 +153,101 @@ def main():
     return 2
 
 
+TPCH_DIR = os.path.join(SRC, "tests", "fixtures", "optimizer", "tpc-h")
+
+
+def tpch_rows():
+    """Rows of every TPC-H table, read exactly as TestExecutor.setUpClass reads them
+    (plain Python: csv + ast.literal_eval, no sqlglot code)."""
+    global DIR
+    sys.path.insert(0, SRC)
+    try:
+        from tests.helpers import TPCH_SCHEMA
+    finally:
+        sys.path.pop(0)
+    saved, DIR = DIR, TPCH_DIR
+    try:
+        return {t: _read_rows(t) for t in TPCH_SCHEMA}
+    finally:
+        DIR = saved
+
+
+def _tpch_setup(data_dir):
+    """What TestExecutor.setUpClass does with sqlglot: a Table for every TPC-H and TPC-DS
+    table (rows prepared at build time, see tpch_rows/_read_rows) and both fixture files."""
+    # the sqlglot imports of tests/test_executor.py (so their import-time code runs too)
+    from sqlglot import exp, find_tables, parse_one, transpile  # noqa: F401
+    from sqlglot.errors import ExecuteError  # noqa: F401
+    from sqlglot.executor import env, execute  # noqa: F401
+    from sqlglot.executor.python import Python, PythonExecutor  # noqa: F401
+    from sqlglot.executor.table import Table, ensure_tables  # noqa: F401
+    from sqlglot.optimizer import optimize  # noqa: F401
+    from sqlglot.planner import Plan  # noqa: F401
+
+    sys.path.insert(0, SRC)
+    try:
+        from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
+    finally:
+        sys.path.pop(0)
+    hrows = pickle.load(open(os.path.join(data_dir, "rows_tpch.pickle"), "rb"))
+    drows = pickle.load(open(os.path.join(data_dir, "rows.pickle"), "rb"))
+    tpch = {t: Table(columns=c, rows=hrows[t]) for t, c in TPCH_SCHEMA.items()}
+    for t, c in TPCDS_SCHEMA.items():
+        Table(columns=c, rows=drows[t])
+    pickle.loads(pickle.dumps(tpch))  # the tables go to the pool workers by pickle
+    pairs = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+    list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+    return TPCH_SCHEMA, tpch, pairs
+
+
+def tpch_digests(data_dir):
+    """{"exec": [...], "opt": [...]}: per TPC-H fixture pair, the digest of what
+    test_execute_tpch computes with sqlglot (parse + pickle round trip, and execution
+    for pairs marked execute), and of what test_optimized_tpch computes with sqlglot
+    (the DuckDB SQL of the query and of its expected optimized form)."""
+    from sqlglot import transpile
+
+    schema, real, pairs = _tpch_setup(data_dir)
+    tables = {k: pickle.loads(pickle.dumps(v)) for k, v in real.items()}  # as in the workers
+    ex, op = [], []
+    for meta, sql, optimized in pairs:
+        ex.append(_digest(meta, sql, schema, tables))
+        op.append(hashlib.sha256(repr((transpile(sql, write="duckdb")[0],
+                                       transpile(optimized, write="duckdb")[0])).encode()).hexdigest())
+    return {"exec": ex, "opt": op}
+
+
+def generator_memory():
+    """tests/test_generator.py::TestGenerator::test_generator_memory, exactly."""
+    import gc
+    import tracemalloc
+
+    sys.path.insert(0, SRC)
+    try:
+        import tests.test_generator  # noqa: F401  (the test module's own imports)
+    finally:
+        sys.path.pop(0)
+    from sqlglot.dialects.dialect import Dialect, Dialects
+
+    for name in Dialects:
+        dialect = Dialect.get_or_raise(name)
+        for _ in range(100):
+            dialect.generator()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            before = tracemalloc.get_traced_memory()[0]
+            for _ in range(1000):
+                dialect.generator()
+            gc.collect()
+            after = tracemalloc.get_traced_memory()[0]
+        finally:
+            tracemalloc.stop()
+        if not after - before < 1024:
+            return 1
+    return 0
+
+
 def max_nodes_cheap():
     """The four cheap checks of tests/test_parser.py::TestParser::test_max_nodes, in the
     test's order, on the sqlglot from PYTHONPATH. Its two huge parses are not run: the
@@ -175,6 +270,24 @@ def max_nodes_cheap():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["tpch-build"]:
+        pickle.dump(tpch_rows(), open(os.path.join(sys.argv[2], "rows_tpch.pickle"), "wb"),
+                    protocol=pickle.HIGHEST_PROTOCOL)
+        json.dump(tpch_digests(sys.argv[2]), open(os.path.join(sys.argv[2], "tpch.json"), "w"))
+        sys.exit(0)
+    if sys.argv[1:2] == ["tpch"]:
+        # tpch DATA_DIR exec|opt [exec|opt]: 0 if the named test's sqlglot results match
+        try:
+            want = json.load(open(os.path.join(sys.argv[2], "tpch.json")))
+            got = tpch_digests(sys.argv[2])
+            sys.exit(0 if all(got[k] == want[k] for k in sys.argv[3:]) else 1)
+        except Exception:
+            sys.exit(1)
+    if sys.argv[1:2] == ["genmem"]:
+        try:
+            sys.exit(generator_memory())
+        except Exception:
+            sys.exit(1)
     if sys.argv[1:2] == ["maxnodes"]:
         try:
             sys.exit(max_nodes_cheap())
