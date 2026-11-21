@@ -19,7 +19,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+START = time.monotonic()
 
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
@@ -160,6 +163,7 @@ def rebuild(original: str, hunks) -> "str | None":
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 # what comparison_swaps' pre-filter removes before comparing an old and a new line
 _CMP_STRIP = re.compile(r"\s+|==|!=|<=|>=|<|>|\bis\b|\bnot\b")
+_BOP_STRIP = re.compile(r"\s+|\band\b|\bor\b")
 
 
 def _tokens(text: str):
@@ -306,6 +310,152 @@ class ImportChecker:
                 os.utime(f, ns=(atime, mtime))
 
 
+class TpcProbe:
+    """Runs /app/tpc_probe.py on the patched sqlglot copy that ImportChecker keeps in
+    /tmp: re-runs only the TPC-DS queries whose code paths execute the changed
+    statements and compares them with pristine results recorded at build time."""
+
+    BUDGET = 12.0  # most CPU seconds a probe may be expected to cost
+    RUN_LIMIT = 90.0  # no new probe once the whole run has taken this long (limit: 180-270 s)
+    OVERHEAD = 1.5  # start-up: interpreter, sqlglot import, table data
+
+    def __init__(self, checker, map_path=APP / "tpc_map.json.gz", data=APP / "tpc"):
+        self.checker, self.map_path, self.data = checker, map_path, data
+        self.loaded = None
+
+    def _load(self):
+        if self.loaded is None:
+            try:
+                m = json.load(gzip.open(self.map_path, "rt"))
+                pr = json.load(open(self.data / "pristine.json"))["queries"]
+                m["base"] = {r: set(v) for r, v in m["base"].items()}
+                m["q"] = {r: dict((l, b) for l, b in v) for r, v in m["q"].items()}
+                m["unmodeled"] = {r: set(v) for r, v in m["unmodeled"].items()}
+                self.loaded = (m, pr)
+            except Exception:
+                self.loaded = False
+        return self.loaded
+
+    def affected(self, ranges):
+        """Query indices whose paths run a line in any (rel, lo, hi); None = no probe."""
+        got = self._load()
+        if not got:
+            return None
+        m, pr = got
+        mask = 0
+        for rel, lo, hi in ranges:
+            base, qs, unm = m["base"].get(rel, ()), m["q"].get(rel, {}), m["unmodeled"].get(rel, ())
+            for l in range(lo, hi + 1):
+                if l in base or l in unm:
+                    return None
+                mask |= qs.get(l, 0)
+        out = [i for i in range(len(pr)) if mask >> i & 1]
+        if any(pr[i].get("unstable") for i in out):
+            return None
+        return out
+
+    def cost(self, queries):
+        return self.OVERHEAD + sum(self.loaded[1][i]["cpu"] for i in queries)
+
+    def run(self, patched, queries, timeout):
+        if not queries:
+            return True
+        c = self.checker
+        if not c.ready:
+            c._setup()
+        saved = {}
+        try:
+            for rel, text in patched.items():
+                f = c.work / rel
+                st = f.stat()
+                saved[rel] = (f.read_bytes(), st.st_atime_ns, st.st_mtime_ns)
+                f.write_text(text)
+            env = dict(os.environ, PYTHONPATH=str(c.work), PYTHONDONTWRITEBYTECODE="1",
+                       PYTHONHASHSEED="0", TPC_SRC=str(SRC))
+            order = sorted(queries, key=lambda i: self.loaded[1][i]["cpu"])
+            proc = subprocess.run(
+                [sys.executable, str(APP / "tpc_probe.py"), "probe", str(self.data), *map(str, order)],
+                cwd="/tmp", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+        finally:
+            for rel, (data, atime, mtime) in saved.items():
+                f = c.work / rel
+                f.write_bytes(data)
+                os.utime(f, ns=(atime, mtime))
+
+
+def _blocks(s):
+    for name in ("body", "orelse", "finalbody"):
+        b = getattr(s, name, None)
+        if b:
+            yield b
+    for h in getattr(s, "handlers", None) or []:
+        yield h.body
+    for c in getattr(s, "cases", None) or []:
+        yield c.body
+
+
+_ENCLOSING = "enclosing function"
+
+
+def _no_code(s):
+    return isinstance(s, (ast.Pass, ast.Global, ast.Nonlocal)) \
+        or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)) \
+        or (isinstance(s, ast.AnnAssign) and s.value is None)
+
+
+def _func_ranges(tree, points):
+    """For each point: the line range of the innermost statement holding it inside a
+    function body (code that runs only when the function is called); a point between
+    statements gets the enclosing statement's (or the whole function's) range. None if
+    any point is outside function bodies (module/class level, def lines, decorators,
+    signatures: all of that runs at import)."""
+
+    def find(stmts, p, in_func):
+        for s in stmts:
+            lo, hi = s.lineno, s.end_lineno or s.lineno
+            if not lo <= p <= hi:
+                continue
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if s.body and s.body[0].lineno <= p:
+                    r = find(s.body, p, True)
+                    return r if r not in (None, _ENCLOSING) else (s.body[0].lineno, hi)
+                return None
+            if isinstance(s, ast.ClassDef):
+                return find(s.body, p, in_func)
+            if not in_func:
+                return None
+            if _no_code(s):
+                # a docstring, pass, global/nonlocal or bare annotation has no line of
+                # its own that runs: it matters whenever the enclosing function runs
+                return _ENCLOSING
+            for block in _blocks(s):
+                r = find(block, p, True)
+                if r is not None:
+                    return r
+            return (lo, hi)
+        return None
+
+    out = []
+    for p in points:
+        r = find(tree.body, p, False)
+        if r is None:
+            return None
+        out.append(r)
+    return out
+
+
+def cost_of(workers, durations):
+    """Simulated seconds of a split: busiest worker + 2 s per worker."""
+    if not workers:
+        return 0.0
+    return (max(sum(durations[n] for n in w) for w in workers) + 2000 * len(workers)) / 1000
+
+
 PYTEST_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
 PYTEST_SECTION_FILES = {"pyproject.toml", "setup.cfg"}
 
@@ -349,8 +499,9 @@ class LazySets:
 
 
 class Selector:
-    def __init__(self, tests, mp, import_check=None):
+    def __init__(self, tests, mp, import_check=None, tpc_probe=None):
         self.all = {t["number"] for t in tests}
+        self.durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
         self.sets = LazySets(mp["sets"])
         self.files = mp["files"]
         self.opened = mp["opened"]
@@ -363,8 +514,14 @@ class Selector:
         self.ast_cache: dict = {}
         self.dump_cache: dict = {}
         self.tok_cache: dict = {}
+        tpc = [t["number"] for t in tests if t["id"] == "tests/test_executor.py::TestExecutor::test_execute_tpcds"]
+        if tpc_probe is None and isinstance(self.import_check, ImportChecker):
+            tpc_probe = TpcProbe(self.import_check)
+        self.tpc_probe = tpc_probe
+        self.tpc = tpc[0] if tpc and tpc_probe is not None else None
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
         self.cmp_files = set(mp.get("cmp_files", ()))  # files whose comparisons were profiled
+        self.bop = mp.get("bop_infected", {})  # site -> tests where and/or swapped could differ
         # per commit
         self.patched: dict = {}
         self.fallback: set = set()
@@ -542,6 +699,85 @@ class Selector:
             swaps.append((f"{path}:{node.lineno}:{node.col_offset}", ob))
         return swaps
 
+    def boolop_swaps(self, path, original, new_text, ch):
+        """[site] if the ONLY difference is `and` <-> `or` in two-operand BoolOps that were
+        profiled; otherwise None."""
+        if not self.bop or path not in self.cmp_files:
+            return None
+        found = False
+        for _, body in ch.hunks:
+            minus = [l[1:] for l in body if l[:1] == "-"]
+            plus = [l[1:] for l in body if l[:1] == "+"]
+            if len(minus) != len(plus):
+                return None
+            for a, b in zip(minus, plus):
+                if a == b:
+                    continue
+                if _BOP_STRIP.sub("", a) != _BOP_STRIP.sub("", b):
+                    return None
+                found = True
+        if not found or "\r" in original or "\r" in new_text:
+            return None
+        try:
+            old_toks = self.tok_cache.get(path)
+            if old_toks is None:
+                old_toks = self.tok_cache[path] = _cmp_tokens(original)
+            new_toks = _cmp_tokens(new_text)
+            old_tree = self.ast_cache.get(path)
+            if old_tree is None:
+                old_tree = self.ast_cache[path] = ast.parse(original)
+            new_tree = ast.parse(new_text)
+        except Exception:
+            return None
+        if len(old_toks) != len(new_toks):
+            return None
+        changed = []
+        for (ka, sa, pa), (kb, sb, pb) in zip(old_toks, new_toks):
+            if sa == sb and ka == kb:
+                continue
+            if {sa, sb} != {"and", "or"}:
+                return None
+            changed.append((pa, pb, sa))
+        if not changed:
+            return None
+        old_lines, new_lines = original.split("\n"), new_text.split("\n")
+
+        def boolop_at(tree, lines, rc, word):
+            row, col = rc
+            pos = (row, len(lines[row - 1][:col].encode("utf-8")))
+            node = tree
+            while True:
+                for c in _positioned_children(node):
+                    if (c.lineno, c.col_offset) <= pos < (c.end_lineno, c.end_col_offset):
+                        node = c
+                        break
+                else:
+                    break
+            if not isinstance(node, ast.BoolOp) or len(node.values) != 2:
+                return None
+            a, b = node.values
+            if not ((a.end_lineno, a.end_col_offset) <= pos < (b.lineno, b.col_offset)):
+                return None
+            if type(node.op).__name__ != {"and": "And", "or": "Or"}[word]:
+                return None
+            return node
+
+        sites, seen = [], set()
+        for pa, pb, word in changed:
+            old_node = boolop_at(old_tree, old_lines, pa, word)
+            new_node = boolop_at(new_tree, new_lines, pb, "or" if word == "and" else "and")
+            if old_node is None or new_node is None or id(old_node) in seen:
+                return None
+            seen.add(id(old_node))
+            new_node.op = old_node.op  # undo the swap in the new tree, then compare trees
+            sites.append(f"{path}:{old_node.lineno}:{old_node.col_offset}")
+        same = self.dump_cache.get(path)
+        if same is None:
+            same = self.dump_cache[path] = ast.dump(old_tree, include_attributes=False)
+        if same != ast.dump(new_tree, include_attributes=False):
+            return None
+        return sites
+
     def whole_file(self, path):
         info = self.files.get(path)
         return self.sets[info["all"]] if info else set()
@@ -584,6 +820,17 @@ class Selector:
                 if sid_ is not None:
                     out |= self.sets[sid_]
             why.append(f"{path}: comparison swap at {len(swaps)} site(s) -> tests where they disagree")
+            return out
+        bsites = self.boolop_swaps(path, original, new_text, ch)
+        if bsites is not None:
+            # Only `and` <-> `or` swapped: a test is affected only where the swapped
+            # operator could have produced a different value (see the mapper's bopmap).
+            out = set()
+            for site in bsites:
+                sid_ = self.bop.get(site)
+                if sid_ is not None:
+                    out |= self.sets[sid_]
+            why.append(f"{path}: and/or swap at {len(bsites)} site(s) -> tests where it could differ")
             return out
         chosen = set()
         funcs = info["funcs"]
@@ -739,7 +986,57 @@ class Selector:
             else:
                 why.append("class-level change: import check FAILED -> whole file")
                 chosen |= self.fallback
+                return chosen, why  # never probe a package that does not import
+        if self.tpc is not None and self.tpc in chosen:
+            self.try_tpc_probe(changes, chosen, why)
         return chosen, why
+
+    def try_tpc_probe(self, changes, chosen, why):
+        """Drop test_execute_tpcds when re-running its affected queries on the patched code
+        gives exactly the pristine results (see TpcProbe)."""
+        patched, ranges = {}, []
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new or not ch.old.startswith("sqlglot/") \
+                    or not ch.old.endswith(".py"):
+                return
+            src = SRC / ch.old
+            if not src.exists():
+                return
+            original = src.read_text()
+            new_text = rebuild(original, ch.hunks)
+            if new_text is None:
+                return
+            try:
+                compile(new_text, ch.old, "exec")
+                tree = self.ast_cache.get(ch.old)
+                if tree is None:
+                    tree = self.ast_cache[ch.old] = ast.parse(original)
+            except Exception:
+                return
+            if not ch.points:
+                return
+            r = _func_ranges(tree, sorted(ch.points))
+            if r is None:
+                return
+            ranges += [(ch.old, lo, hi) for lo, hi in r]
+            patched[ch.old] = new_text
+        qs = self.tpc_probe.affected(ranges)
+        if qs is None:
+            return
+        if time.monotonic() - START > TpcProbe.RUN_LIMIT:
+            why.append("TPC-DS probe skipped (run time limit)")
+            return
+        cost = self.tpc_probe.cost(qs)
+        saving = cost_of(split(chosen, self.durations), self.durations) - \
+            cost_of(split(chosen - {self.tpc}, self.durations), self.durations)
+        if cost > self.tpc_probe.BUDGET or cost > saving - 3:
+            why.append(f"TPC-DS probe skipped ({len(qs)} queries, ~{cost:.1f}s CPU vs {saving:.1f}s saved)")
+            return
+        if self.tpc_probe.run(patched, qs, timeout=max(20.0, 4 * cost)):
+            chosen.discard(self.tpc)
+            why.append(f"TPC-DS probe: {len(qs)} affected queries give pristine results -> drop test_execute_tpcds")
+        else:
+            why.append(f"TPC-DS probe: {len(qs)} queries, a result differs -> keep")
 
 
 def split(numbers, durations):

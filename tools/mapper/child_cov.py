@@ -11,6 +11,24 @@ import os
 def start():
     parent = os.environ.get("MAP_PARENT_PID")
     test = os.environ.get("MAP_TEST")
+    if os.environ.get("MAP_MODE") == "bop" and test:
+        # every process: profile and/or operators
+        import atexit
+
+        import bopmap
+
+        bopmap.install()
+        atexit.register(bopmap.dump)
+        real_exit_b = os._exit
+
+        def _exit_bop(code):
+            try:
+                bopmap.dump()
+            finally:
+                real_exit_b(code)
+
+        os._exit = _exit_bop
+        return
     if os.environ.get("MAP_MODE") == "cmp" and test:
         # every process: profile comparison operators
         import atexit

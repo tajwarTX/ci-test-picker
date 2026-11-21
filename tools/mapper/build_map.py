@@ -411,12 +411,32 @@ if cmp_paths:
     print(f"comparisons: {len(differ)} sites ever disagree with a partner; files profiled {len(cmp_files_out)}",
           file=sys.stderr)
 
+# ---- and/or profile (bop*.json) -------------------------------------------------------
+bop_out = {}
+bop_paths = [f for run in run_dirs for f in glob.glob(os.path.join(run, "bop.*.json"))]
+if bop_paths:
+    seen_b, inf = set(), {}
+    for path in bop_paths:
+        d = json.load(open(path))
+        n = ctx_to_test(d["test"])
+        if n is None:
+            continue
+        seen_b.add(n)
+        for site in d["infected"]:
+            inf.setdefault(site, set()).add(n)
+    missing = [t["id"] for t in tests if t["number"] not in seen_b]
+    if missing:
+        sys.exit(f"REFUSING TO BUILD: {len(missing)} tests have no and/or data, e.g. {missing[:3]}")
+    bop_out = {site: sid(ts) for site, ts in inf.items()}
+    print(f"and/or: {len(bop_out)} sites infected by some test", file=sys.stderr)
+
 result = {
     "sets": [list(k) for k in sorted(set_ids, key=set_ids.get)],
     "files": files_out,
     "containers": containers_out,
     "cmp_files": cmp_files_out,
     "cmp_differ": cmp_differ_out,
+    "bop_infected": bop_out,
     # keep only real repository paths (the executor compiles generated code under
     # pseudo file names, which the open/compile recorder also sees)
     "opened": {p: sid(s) for p, s in sorted(opened.items()) if os.path.exists(os.path.join(SRC, p))},
