@@ -21,6 +21,8 @@ RUN python -m compileall -q /app/src/sqlglot \
 # Coverage/class-usage map built from the pinned commit (tools/mapper), committed as a plain file.
 COPY selector.py /app/selector.py
 COPY data/map.json.gz /app/map.json.gz
-RUN chmod -R a+rX /app
+# Same map in Python's binary format: loads several times faster at run time.
+RUN python -c "import gzip, json, pickle; pickle.dump(json.load(gzip.open('/app/map.json.gz', 'rt')), open('/app/map.pickle', 'wb'), protocol=pickle.HIGHEST_PROTOCOL)" \
+ && chmod -R a+rX /app
 
 CMD ["python", "/app/selector.py"]

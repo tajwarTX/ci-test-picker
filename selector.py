@@ -23,6 +23,7 @@ from pathlib import Path
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent
 MAP = APP / "map.json.gz"
+MAP_PICKLE = APP / "map.pickle"  # same content, written at build time (faster to load)
 SRC = APP / "src"  # pristine sqlglot checkout at the pinned commit (.py files)
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -180,6 +181,24 @@ def same_code(old: str, new: str) -> bool:
         return False
 
 
+def maybe_comment_only(ch) -> bool:
+    """Cheap pre-check before the (slow) token comparison. If the changed lines still
+    differ after ignoring whitespace and lines that start with '#', the change touches
+    code, so it is NOT comment-only. Can only answer 'maybe' or 'no', never a wrong 'yes'."""
+    removed, added = [], []
+    for _, body in ch.hunks:
+        for l in body:
+            if l[:1] == "-":
+                removed.append(l[1:])
+            elif l[:1] == "+":
+                added.append(l[1:])
+
+    def code(lines):
+        return ["".join(l.split()) for l in lines if l.strip() and not l.strip().startswith("#")]
+
+    return code(removed) == code(added)
+
+
 class ImportChecker:
     """Imports every sqlglot module from a patched copy of the pristine tree in /tmp."""
 
@@ -225,10 +244,24 @@ class ImportChecker:
                 os.utime(f, ns=(atime, mtime))
 
 
+class LazySets:
+    """Turns a stored test list into a set only when a commit needs it."""
+
+    def __init__(self, lists):
+        self.lists = lists
+        self.cache: dict = {}
+
+    def __getitem__(self, i):
+        s = self.cache.get(i)
+        if s is None:
+            s = self.cache[i] = set(self.lists[i])
+        return s
+
+
 class Selector:
     def __init__(self, tests, mp, import_check=None):
         self.all = {t["number"] for t in tests}
-        self.sets = [set(s) for s in mp["sets"]]
+        self.sets = LazySets(mp["sets"])
         self.files = mp["files"]
         self.opened = mp["opened"]
         self.stmt_cache: dict = {}
@@ -257,7 +290,7 @@ class Selector:
         except SyntaxError:
             why.append(f"{path}: does not compile -> whole file")
             return self.whole_file(path) if info else self.all
-        if same_code(original, new_text):
+        if maybe_comment_only(ch) and same_code(original, new_text):
             why.append(f"{path}: only comments/blank lines/spacing changed -> none")
             return set()
         if info is None:
@@ -406,8 +439,15 @@ def main() -> None:
     durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     all_numbers = set(durations)
     try:
-        with gzip.open(MAP, "rt") as f:
-            sel = Selector(tests, json.load(f))
+        if MAP_PICKLE.exists():
+            import pickle
+
+            with open(MAP_PICKLE, "rb") as f:
+                mp = pickle.load(f)
+        else:
+            with gzip.open(MAP, "rt") as f:
+                mp = json.load(f)
+        sel = Selector(tests, mp)
     except Exception as e:
         log(f"map failed to load ({e!r}); running everything")
         sel = None
