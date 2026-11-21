@@ -1387,7 +1387,8 @@ class Selector:
     def diagnose_all(self, patch_text, chosen, why):
         if self.tpc_probe is None or time.monotonic() - START > self.DIAG_BUDGET:
             return None
-        run = {n for n in chosen if self.test_ids[n] not in self.GIANTS}
+        # D-heavy: verdicts only for the heavy tests (>= 0.4 s); light tests stay as v13 chose them
+        run = {n for n in chosen if self.test_ids[n] not in self.GIANTS and self.durations[n] >= 400}
         if not run or sum(self.durations[n] for n in run) > 25000:
             return None
         try:
@@ -1429,7 +1430,7 @@ class Selector:
             assert res["ran"] == len(ids) and failed <= set(ids)
         except Exception:
             return None
-        keep = {n for n in chosen if self.test_ids[n] in failed or self.test_ids[n] in self.GIANTS}
+        keep = {n for n in chosen if n not in run or self.test_ids[n] in failed}
         why.append(f"DIAG ran {len(ids)}: {len(failed)} fail")
         return keep
 
