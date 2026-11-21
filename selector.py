@@ -461,6 +461,35 @@ def _innermost_stmt(stmts, p):
     return None
 
 
+def parse_patch_cache(sel, rel):
+    c = sel._changes.get(rel)
+    return [c] if c is not None else []
+
+
+def _swappable_function(stmts, p, path):
+    """(qualname, FunctionDef) of the plain function/method whose BODY holds line p,
+    reached only through classes, with p not inside a nested def/lambda/class; else None."""
+    for s in stmts:
+        if not (s.lineno <= p <= (s.end_lineno or s.lineno)):
+            continue
+        if isinstance(s, ast.ClassDef):
+            if s.decorator_list:
+                return None
+            return _swappable_function(s.body, p, path + [s.name])
+        if isinstance(s, ast.FunctionDef):
+            if any(not (isinstance(d, ast.Name) and d.id in ("staticmethod", "classmethod")) for d in s.decorator_list):
+                return None
+            if not s.body or p < s.body[0].lineno:
+                return None  # def line / signature
+            for n in ast.walk(s):
+                if n is not s and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)) \
+                        and n.lineno <= p <= (n.end_lineno or n.lineno):
+                    return None  # inside a nested function/lambda/class
+            return ".".join(path + [s.name]), s
+        return None  # module-level statement
+    return None
+
+
 def _blocks(s):
     for name in ("body", "orelse", "finalbody"):
         b = getattr(s, name, None)
@@ -597,6 +626,9 @@ class Selector:
         self._max_map = None
         self._grpa_map = None
         self.test_ids = {t["number"]: t["id"] for t in tests}
+        self._imp = None
+        self._server = None
+        self._changes = {}
         self.whole_tests = {t["number"]: t["id"] for t in tests if t["id"] in self.WHOLE} \
             if tpc_probe is not None else {}
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
@@ -1246,6 +1278,7 @@ class Selector:
             changes = parse_patch(patch_text)
         except Exception:
             return chosen
+        self._changes = {c.old: c for c in changes if c.old}
         patched = {}
         for ch in changes:
             if ch.binary or ch.old is None or ch.old != ch.new or not ch.old.startswith("sqlglot/") \
@@ -1259,7 +1292,9 @@ class Selector:
                 return chosen
             patched[ch.old] = new_text
         ids = sorted(self.test_ids[n] for n in chosen)
-        out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 60, capture=True)
+        out = self._serve_run(patched, ids)
+        if out is None:
+            out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 60, capture=True)
         try:
             res = json.loads(out.strip().splitlines()[-1])
             if res.get("stopped"):
@@ -1271,6 +1306,79 @@ class Selector:
             return chosen
         why.append(f"ran {len(ids)} selected tests here: all pass -> none")
         return set()
+
+    def _swap_plan(self, patched):
+        """{rel: {"text", "functions"}} when every change only edits the bodies of plain
+        top-level functions or methods (no decorators but static/classmethod, change not
+        inside a nested def/lambda/class) that never run at import time; else None."""
+        imp = self.import_lines()
+        if imp is None:
+            return None
+        plan = {}
+        for rel, new_text in patched.items():
+            original = (SRC / rel).read_text()
+            if same_code(original, new_text):
+                continue
+            try:
+                tree = self.ast_cache.get(rel) or ast.parse(original)
+                self.ast_cache[rel] = tree
+            except SyntaxError:
+                return None
+            ch = next((c for c in parse_patch_cache(self, rel)), None)
+            if ch is None or not ch.points:
+                return None
+            funcs = set()
+            for p in ch.points:
+                found = _swappable_function(tree.body, p, [])
+                if found is None:
+                    return None
+                qn, fn = found
+                body_lines = range(fn.body[0].lineno, fn.end_lineno + 1)
+                if any(l in imp.get(rel, ()) for l in body_lines):
+                    return None  # runs at import time: state built from it is not swapped
+                funcs.add(qn)
+            plan[rel] = {"text": new_text, "functions": sorted(funcs)}
+        return plan
+
+    def import_lines(self):
+        if self._imp is None:
+            try:
+                self._imp = {r: set(v) for r, v in json.load(gzip.open(APP / "import_lines.json.gz", "rt")).items()}
+            except Exception:
+                self._imp = False
+        return self._imp or None
+
+    def _serve_run(self, patched, ids):
+        """Run through the warm fork server; None if not applicable or anything fails."""
+        plan = self._swap_plan(patched)
+        if not plan:
+            return None
+        try:
+            srv = self._server
+            if srv is None:
+                env = dict(os.environ, PYTHONPATH=str(SRC), PYTHONDONTWRITEBYTECODE="1", PYTHONHASHSEED="0",
+                           TPC_SRC=str(SRC), BR_STOP_ON_FAIL="1")
+                srv = self._server = subprocess.Popen(
+                    [sys.executable, str(APP / "runner.py"), "--serve"], cwd="/tmp", env=env, text=True,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            srv.stdin.write(json.dumps({"files": plan, "ids": ids}) + "\n")
+            srv.stdin.flush()
+            import select as _select
+            ready, _, _ = _select.select([srv.stdout], [], [], 60)
+            if not ready:
+                raise TimeoutError
+            line = srv.stdout.readline()
+            res = json.loads(line)
+            if res.get("noswap") or res.get("error"):
+                return None
+            return line
+        except Exception:
+            try:
+                self._server.kill()
+            except Exception:
+                pass
+            self._server = False
+            return None
 
     def _heavy_module(self, path):
         cache = self.__dict__.setdefault("_heavy_cache", {})
