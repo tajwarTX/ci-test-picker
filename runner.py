@@ -61,6 +61,26 @@ class Result(unittest.TestResult):
         self.bad.add(self._id(test))
 
 
+def _overlay(files):
+    """Serve patched data files (fixtures) from memory for exactly those paths."""
+    import builtins
+    import io
+
+    real = io.open
+
+    def opener(file, mode="r", *args, **kwargs):
+        try:
+            key = os.path.abspath(os.fspath(file))
+        except TypeError:
+            key = None
+        if key in files and not any(c in mode for c in "wax+"):
+            return io.BytesIO(files[key].encode("utf-8")) if "b" in mode else io.StringIO(files[key])
+        return real(file, mode, *args, **kwargs)
+
+    builtins.open = opener
+    io.open = opener
+
+
 _CASES: dict = {}  # test id -> set of allowed (loader, filename, idx); tests not listed run whole
 _CURRENT = [None]
 
@@ -93,6 +113,9 @@ def _install_case_filter():
 
 def main(ids, cases=None):
     os.environ["SKIP_INTEGRATION"] = "0"
+    fx = os.environ.get("BR_FIXTURES")
+    if fx:  # DIAGNOSTIC: patched fixture files, served from memory
+        _overlay({os.path.join(SRC, k): v for k, v in json.load(open(fx)).items()})
     cf.ProcessPoolExecutor = SyncExecutor
     import concurrent.futures.process as cfp
     cfp.ProcessPoolExecutor = SyncExecutor
