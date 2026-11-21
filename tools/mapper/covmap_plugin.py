@@ -72,6 +72,6 @@ def pytest_unconfigure(config):
     _cov.save()
     name = "opened.json"
     if ISOLATED:
-        name = f"opened.{os.getpid()}.json"
+        name = f"opened.{os.getpid()}.{__import__('time').time_ns()}.json"
     with open(os.path.join(OUT, name), "w") as f:
         json.dump({k: sorted(v) for k, v in _opened.items()}, f)

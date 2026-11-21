@@ -10,8 +10,10 @@ import json
 import os
 import sys
 import threading
+import time
 
 _seen: set = set()
+_SQLGLOT = os.environ.get("MAP_SRC", "/src") + "/sqlglot/"
 # Calls Python makes while CREATING classes (import time), not real use of them.
 _CREATION = {"__init_subclass__", "__set_name__", "wrap", "trait"}
 
@@ -32,8 +34,19 @@ def _prof(frame, event, arg):
     except Exception:
         return
     t = obj if isinstance(obj, type) else type(obj)
-    if t not in _seen:
-        _seen.add(t)
+    if t in _seen:
+        return
+    # Ignore calls made while a sqlglot module is being loaded (e.g. the parser
+    # building its function-name tables from every expression class). Calls from
+    # tests, and from test files' own top-level code, still count.
+    f = frame.f_back
+    while f is not None:
+        if f.f_code.co_name == "<module>":
+            if f.f_code.co_filename.startswith(_SQLGLOT):
+                return
+            break
+        f = f.f_back
+    _seen.add(t)
 
 
 def install():
@@ -53,5 +66,5 @@ def dump(test_id):
             if mod.startswith(("sqlglot", "tests")):
                 keys.add(f"{mod}:{k.__qualname__}")
     out = os.environ.get("MAP_OUT", "/out")
-    with open(os.path.join(out, f"usage.{os.getpid()}.json"), "w") as f:
+    with open(os.path.join(out, f"usage.{os.getpid()}.{time.time_ns()}.json"), "w") as f:
         json.dump({test_id: sorted(keys)}, f)

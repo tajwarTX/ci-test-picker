@@ -83,6 +83,13 @@ for run in run_dirs:
             for k in keys:
                 usage.setdefault(k, set()).add(n)
 
+# Narrowing by class usage is only safe if EVERY test's usage was recorded.
+if usage:
+    covered = set().union(*usage.values())
+    missing = [t["id"] for t in tests if t["number"] not in covered]
+    if missing:
+        sys.exit(f"REFUSING TO BUILD: {len(missing)} tests have no class-usage data, e.g. {missing[:3]}")
+
 set_ids: dict[tuple, int] = {}
 
 
@@ -163,11 +170,12 @@ def scan_names(rel, tree, per, body_lines):
     def visit(node, stmt, owner):
         if isinstance(node, ast.stmt):
             stmt = node
-            if isinstance(owner, ast.ClassDef) and isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if isinstance(owner, (ast.ClassDef, ast.Module)) and isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 names = [t.id for t in targets if isinstance(t, ast.Name)]
                 if names and len(names) == len(targets) and all(UPPER.match(n) for n in names):
-                    assigns.append((node.lineno, node.end_lineno, names))
+                    assigns.append((node.lineno, node.end_lineno, names,
+                                    "class" if isinstance(owner, ast.ClassDef) else "module"))
         definition = (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
                       and isinstance(owner, (ast.ClassDef, ast.Module)))
         if not definition:
@@ -233,11 +241,13 @@ for rel, per in sorted(line_tests.items()):
 # Class-body settings that can be narrowed: every assigned name is UPPER_CASE, is
 # mentioned somewhere inside a function, and never outside one.
 for rel, assigns in class_assigns.items():
-    out = []
-    for start, end, names in assigns:
+    out, mout = [], []
+    for start, end, names, where in assigns:
         if all(n in name_refs and n not in name_bad for n in names):
-            out.append([start, end, sid(set().union(*(name_refs[n] for n in names)))])
+            (out if where == "class" else mout).append(
+                [start, end, sid(set().union(*(name_refs[n] for n in names)))])
     files_out[rel]["settings"] = out
+    files_out[rel]["msettings"] = mout
 
 result = {
     "sets": [list(k) for k in sorted(set_ids, key=set_ids.get)],

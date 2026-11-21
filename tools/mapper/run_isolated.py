@@ -19,13 +19,16 @@ only = set(sys.argv[3:])  # optional subset of ids for trials
 def run(test):
     env = dict(os.environ, MAP_TEST=test["id"])
     start = time.time()
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", os.environ.get("MAP_PLUGIN", "covmap_plugin"), "-q", "-p", "no:cacheprovider",
-         "-x", test["id"]],
-        env=env, cwd="/src", capture_output=True, text=True, timeout=900,
-    )
-    return {"id": test["id"], "rc": proc.returncode, "secs": round(time.time() - start, 2),
-            "tail": proc.stdout[-300:] if proc.returncode else ""}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", os.environ.get("MAP_PLUGIN", "covmap_plugin"), "-q",
+             "-p", "no:cacheprovider", "-x", test["id"]],
+            env=env, cwd="/src", capture_output=True, text=True, timeout=1800,
+        )
+        rc, tail = proc.returncode, (proc.stdout[-300:] if proc.returncode else "")
+    except subprocess.TimeoutExpired:
+        rc, tail = -999, "TIMEOUT"
+    return {"id": test["id"], "rc": rc, "secs": round(time.time() - start, 2), "tail": tail}
 
 
 todo = [t for t in tests if not only or t["id"] in only]

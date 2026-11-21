@@ -308,8 +308,20 @@ class Selector:
                     self.fallback |= self.whole_file(path)
                     kinds.append("class")
                 else:
-                    chosen |= self.whole_file(path)
-                    kinds.append("file")
+                    msetting = None
+                    if cls is None and path.startswith("sqlglot/"):
+                        for start, end, s in info.get("msettings", []):
+                            if start <= p <= end:
+                                msetting = s
+                    if msetting is not None:
+                        # An UPPER_CASE module constant: tests that loaded this file AND
+                        # ran a line that reads the constant by name (import-checked).
+                        chosen |= self.whole_file(path) & self.sets[msetting]
+                        self.fallback |= self.whole_file(path)
+                        kinds.append("setting")
+                    else:
+                        chosen |= self.whole_file(path)
+                        kinds.append("file")
             elif multi.get(p, p) in stmt_set:
                 # an executable statement: only tests that actually ran it can notice
                 chosen |= self.sets[stmt_set[multi.get(p, p)]]
