@@ -521,7 +521,9 @@ class Selector:
         self.tpc = tpc[0] if tpc and tpc_probe is not None else None
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
         self.cmp_files = set(mp.get("cmp_files", ()))  # files whose comparisons were profiled
-        self.bop = mp.get("bop_infected", {})  # site -> tests where and/or swapped could differ
+        # site -> tests where and/or swapped could differ. Only maps from the side-effect-aware
+        # profiler (bop_version >= 2) are used: version 1 ignored effects of the skipped operand.
+        self.bop = mp.get("bop_infected", {}) if mp.get("bop_version", 1) >= 2 else {}
         # per commit
         self.patched: dict = {}
         self.fallback: set = set()
@@ -533,6 +535,71 @@ class Selector:
             if start < p < end and (best is None or end - start < best[1] - best[0]):
                 best = (start, end, cid)
         return best[2] if best else None
+
+    def container_edge(self, path, p, original, new_text):
+        """The innermost tracked container holding line p, provided the WHOLE edit of
+        this file is confined strictly inside its braces: every token before its `{`
+        and from its matching `}` on is unchanged, and in the new file that `{` still
+        opens a container closed by that `}`. Otherwise None (class/setting rules)."""
+        best = None
+        for start, end, cid in self.container_index.get(path, ()):
+            if start <= p <= end and (best is None or end - start < best[1] - best[0]):
+                best = (start, end, cid)
+        if best is None or "\r" in original or "\r" in new_text:
+            return None
+        cid = best[2]
+        if self.containers[cid]["kind"] not in ("dict", "set"):
+            return None
+        _, line, col = cid.rsplit(":", 2)
+        line, col = int(line), int(col)
+        try:
+            old_tree = self.ast_cache.get(path)
+            if old_tree is None:
+                old_tree = self.ast_cache[path] = ast.parse(original)
+            new_tree = ast.parse(new_text)
+            old_toks = self.tok_cache.get(path)
+            if old_toks is None:
+                old_toks = self.tok_cache[path] = _cmp_tokens(original)
+            new_toks = _cmp_tokens(new_text)
+        except Exception:
+            return None
+        want = (ast.Dict, ast.Set)
+        node = next((n for n in ast.walk(old_tree) if isinstance(n, want)
+                     and n.lineno == line and n.col_offset == col), None)
+        if node is None:
+            return None
+        lines = original.split("\n")
+
+        def char_col(row, bcol):
+            return len(lines[row - 1].encode("utf-8")[:bcol].decode("utf-8", "replace"))
+
+        open_pos = (node.lineno, char_col(node.lineno, node.col_offset))
+        close_pos = (node.end_lineno, char_col(node.end_lineno, node.end_col_offset) - 1)
+        oi = next((k for k, t in enumerate(old_toks) if t[2] == open_pos and t[1] == "{"), None)
+        ci = next((k for k, t in enumerate(old_toks) if t[2] == close_pos and t[1] == "}"), None)
+        if oi is None or ci is None:
+            return None
+        n_old, n_new = len(old_toks), len(new_toks)
+        i = 0
+        while i < min(n_old, n_new) and old_toks[i][:2] == new_toks[i][:2]:
+            i += 1
+        if i == n_old == n_new:
+            return None
+        j = 0
+        while j < min(n_old, n_new) - i and old_toks[n_old - 1 - j][:2] == new_toks[n_new - 1 - j][:2]:
+            j += 1
+        if not (oi < i and ci >= n_old - j):
+            return None  # the edit reaches outside the braces
+        # in the new file the same `{` must open a container closed by the same `}`
+        nci = ci - n_old + n_new
+        nopen, nclose = new_toks[oi][2], new_toks[nci][2]
+        new_lines = new_text.split("\n")
+        for n in ast.walk(new_tree):
+            if isinstance(n, want) and n.lineno == nopen[0] and \
+                    len(new_lines[n.lineno - 1].encode("utf-8")[:n.col_offset].decode("utf-8", "replace")) == nopen[1]:
+                end_c = len(new_lines[n.end_lineno - 1].encode("utf-8")[:n.end_col_offset].decode("utf-8", "replace")) - 1
+                return cid if (n.end_lineno, end_c) == nclose else None
+        return None
 
     def container_change(self, path, original, new_text, cid, ch):
         """Tests affected by the entry changes of one container, or None if unsure."""
@@ -549,15 +616,20 @@ class Selector:
         except SyntaxError:
             return None
         want = ast.Dict if info["kind"] == "dict" else ast.Set
-        delta = 0
-        for start, body in ch.hunks:  # lines added/removed before the container
-            if start < line:
-                plus = sum(1 for l in body if l[:1] == "+")
-                minus = sum(1 for l in body if l[:1] == "-")
-                if start + sum(1 for l in body if l[:1] != "+") <= line:
-                    delta += plus - minus
-                else:
-                    return None
+        delta = 0  # lines added minus removed before the container's first line
+        for start, body in ch.hunks:
+            old_ln = start
+            for l in body:
+                tag = l[:1]
+                if tag == " ":
+                    old_ln += 1
+                elif tag == "-":
+                    if old_ln < line:
+                        delta -= 1
+                    old_ln += 1
+                elif tag == "+":
+                    if old_ln <= line:
+                        delta += 1
         find = lambda tree, ln: next((n for n in ast.walk(tree) if isinstance(n, want)
                                       and n.lineno == ln and n.col_offset == col), None)
         old_node, new_node = find(old_tree, line), find(new_tree, line + delta)
@@ -899,7 +971,7 @@ class Selector:
                 if body <= p <= end and (best is None or end - body < best[1] - best[0]):
                     best = (body, end, s)
             if best is None:
-                cid = self.container_at(path, p)
+                cid = self.container_edge(path, p, original, new_text)
                 if cid is not None:
                     container_points.setdefault(cid, []).append(p)
                 else:
@@ -996,10 +1068,27 @@ class Selector:
         gives exactly the pristine results (see TpcProbe)."""
         patched, ranges = {}, []
         for ch in changes:
-            if ch.binary or ch.old is None or ch.old != ch.new or not ch.old.startswith("sqlglot/") \
-                    or not ch.old.endswith(".py"):
+            if ch.binary or ch.old is None or ch.old != ch.new:
                 return
-            src = SRC / ch.old
+            path = ch.old
+            if not path.endswith(".py"):
+                # a data file the TPC-DS test never opened cannot change what it does
+                if path.rsplit("/", 1)[-1] in PYTEST_FILES | PYTEST_SECTION_FILES:
+                    return
+                sid_ = self.opened.get(path)
+                if sid_ is not None and self.tpc in self.sets[sid_]:
+                    return
+                if sid_ is None and path.startswith(("sqlglot/", "tests/")):
+                    return  # never seen: be careful
+                continue
+            info = self.files.get(path)
+            if info is None or not path.startswith(("sqlglot/", "tests/")):
+                return
+            if self.tpc not in self.sets[info["all"]]:
+                continue  # the TPC-DS test never ran a line of this file (not even its import)
+            if not path.startswith("sqlglot/"):
+                return
+            src = SRC / path
             if not src.exists():
                 return
             original = src.read_text()
@@ -1007,19 +1096,23 @@ class Selector:
             if new_text is None:
                 return
             try:
-                compile(new_text, ch.old, "exec")
-                tree = self.ast_cache.get(ch.old)
+                compile(new_text, path, "exec")
+                tree = self.ast_cache.get(path)
                 if tree is None:
-                    tree = self.ast_cache[ch.old] = ast.parse(original)
+                    tree = self.ast_cache[path] = ast.parse(original)
             except Exception:
                 return
+            if same_code(original, new_text):
+                continue  # comments/spacing only: the same program
             if not ch.points:
                 return
             r = _func_ranges(tree, sorted(ch.points))
             if r is None:
                 return
-            ranges += [(ch.old, lo, hi) for lo, hi in r]
-            patched[ch.old] = new_text
+            ranges += [(path, lo, hi) for lo, hi in r]
+            patched[path] = new_text
+        if not ranges:
+            return
         qs = self.tpc_probe.affected(ranges)
         if qs is None:
             return
