@@ -426,6 +426,23 @@ def _run_patched(checker, patched, args, timeout):
             os.utime(f, ns=(atime, mtime))
 
 
+def _maybe_no_effect(original, ch):
+    """Cheap text pre-check before the full docstring/overload comparison: every changed
+    point lies inside a triple-quoted string or within 40 lines below an @overload.
+    (Only decides whether to TRY that narrowing rule, so it need not be exact.)"""
+    lines = original.split("\n")
+    for p in ch.points:
+        if p < 1 or p > len(lines):
+            return False
+        prefix = "\n".join(lines[: p - 1])
+        inside = (prefix.count('"""') + prefix.count("'''")) % 2 == 1
+        here = '"""' in lines[p - 1] or "'''" in lines[p - 1]
+        stub = any("overload" in l for l in lines[max(0, p - 41): p])
+        if not (inside or here or stub):
+            return False
+    return bool(ch.points)
+
+
 def _innermost_stmt(stmts, p):
     """The innermost statement (any level) whose lines contain p, or None."""
     for s in stmts:
@@ -982,7 +999,7 @@ class Selector:
             # same program (only line numbers can differ)
             why.append(f"{path}: same syntax tree (comment/format edit) -> none")
             return set()
-        kind = self.no_runtime_effect(path, original, new_text)
+        kind = self.no_runtime_effect(path, original, new_text) if _maybe_no_effect(original, ch) else None
         if kind == "docstring" or (kind == "overload" and self.import_check({path: new_text})):
             # Only docstring text (still non-empty) or @overload stubs changed: no scored
             # test reads docstrings, line numbers or overload stubs, and sqlglot's one
