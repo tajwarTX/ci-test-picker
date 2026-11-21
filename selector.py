@@ -882,6 +882,39 @@ class Selector:
             return None
         return sites
 
+    SOURCE_READ = ("sqlglot/typing/",)  # tests/test_typing.py reads these files' source text
+
+    def docstring_only(self, path, original, new_text):
+        if not path.startswith("sqlglot/") or path.startswith(self.SOURCE_READ):
+            return False
+        if original.count("\n") != new_text.count("\n"):
+            return False
+        try:
+            a, b = ast.parse(original), ast.parse(new_text)
+        except SyntaxError:
+            return False
+
+        def docs(tree):
+            out = []
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+                    d = n.body[0]
+                    if isinstance(d, ast.Expr) and isinstance(d.value, ast.Constant) and isinstance(d.value.value, str):
+                        out.append(d)
+            return out
+
+        da, db = docs(a), docs(b)
+        if len(da) != len(db) or not da:
+            return False
+        changed = False
+        for x, y in zip(da, db):
+            if (x.lineno, x.end_lineno) != (y.lineno, y.end_lineno) or bool(x.value.value) != bool(y.value.value):
+                return False
+            if x.value.value != y.value.value:
+                changed = True
+            x.value.value = y.value.value = ""
+        return changed and ast.dump(a) == ast.dump(b)
+
     def whole_file(self, path):
         info = self.files.get(path)
         return self.sets[info["all"]] if info else set()
@@ -909,6 +942,12 @@ class Selector:
             # e.g. a comment edited at the end of a code line: Python builds exactly the
             # same program (only line numbers can differ)
             why.append(f"{path}: same syntax tree (comment/format edit) -> none")
+            return set()
+        if self.docstring_only(path, original, new_text):
+            # only docstring TEXT changed (same lines, still non-empty): no scored test
+            # reads docstrings, and sqlglot's one reader (Expr.__init_subclass__) only
+            # checks emptiness; files whose source a test reads are excluded
+            why.append(f"{path}: docstring text only -> none")
             return set()
         if info is None:
             why.append(f"{path}: never run by any test -> none")
