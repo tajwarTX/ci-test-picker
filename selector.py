@@ -628,6 +628,7 @@ class Selector:
         self.test_ids = {t["number"]: t["id"] for t in tests}
         self._imp = None
         self._server = None
+        self._warm_mods = set()
         self._changes = {}
         self.whole_tests = {t["number"]: t["id"] for t in tests if t["id"] in self.WHOLE} \
             if tpc_probe is not None else {}
@@ -1252,8 +1253,9 @@ class Selector:
              "tests/test_generator.py::TestGenerator::test_generator_memory": ("genmem", None)}
     WHOLE_COST = {"tpch": 1.0, "genmem": 2.5}  # measured 0.73 s / 2.06 s CPU, plus margin
 
-    RUN_MAX_TEST = 1.0  # only tests recorded at <= 1 s are run here
-    RUN_MAX_TOTAL = 3.0  # and at most this many recorded seconds per commit
+    HEAVY_SHARE = 0.4  # experiment: amortized share of the 1.5 s heavy import
+    RUN_MAX_TEST = 2.6  # only tests recorded at <= 2.6 s are run here
+    RUN_MAX_TOTAL = 5.0  # and at most this many recorded seconds per commit
     RUN_OVERHEAD = 1.2  # interpreter + sqlglot + test-module imports (CPU s)
 
     def verify_by_running(self, patch_text, chosen, why):
@@ -1269,9 +1271,13 @@ class Selector:
         # measured: ~0.35 s start + sqlglot, ~0.15 s per test module, ~1.4 s more for a
         # module importing pandas/duckdb, and ~1.6x the recorded test seconds
         mods = {self.test_ids[n].split("::")[0] for n in chosen}
-        if any(self._heavy_module(m) for m in mods):
-            return chosen  # pandas/duckdb imports alone cost ~1.4 s: rarely pays
-        est = 0.35 + 0.15 * len(mods) + 1.6 * sum(secs.values())
+        # pandas/duckdb test modules: only through the warm runner, which imports each test
+        # module once for the whole run (the first time costs ~1.5 s, counted once)
+        heavy = any(self._heavy_module(m) for m in mods)
+        # EXPERIMENT: the ~1.5 s first import of a heavy module is paid once per run and
+        # shared by every commit that later uses it, so each commit is charged a share
+        first = sum(self.HEAVY_SHARE for m in mods if self._heavy_module(m) and m not in self._warm_mods)
+        est = 0.1 + 0.05 * len(mods) + first + 1.6 * sum(secs.values())
         if full - est < 0.6:
             return chosen
         try:
@@ -1279,21 +1285,30 @@ class Selector:
         except Exception:
             return chosen
         self._changes = {c.old: c for c in changes if c.old}
-        patched = {}
+        patched, fixtures = {}, {}
         for ch in changes:
-            if ch.binary or ch.old is None or ch.old != ch.new or not ch.old.startswith("sqlglot/") \
-                    or not ch.old.endswith(".py"):
-                return chosen  # tests, fixtures, other files: not handled here
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return chosen
             src = SRC / ch.old
             if not src.exists():
                 return chosen
+            if ch.old.startswith("tests/fixtures/") and not ch.old.endswith((".py", ".gz")):
+                new_text = rebuild(src.read_text(), ch.hunks)
+                if new_text is None:
+                    return chosen
+                fixtures[ch.old] = new_text  # served from memory by the warm runner only
+                continue
+            if not ch.old.startswith("sqlglot/") or not ch.old.endswith(".py"):
+                return chosen  # tests code, other files: not handled here
             new_text = rebuild(src.read_text(), ch.hunks)
             if new_text is None:
                 return chosen
             patched[ch.old] = new_text
         ids = sorted(self.test_ids[n] for n in chosen)
-        out = self._serve_run(patched, ids)
+        out = self._serve_run(patched, ids, fixtures)
         if out is None:
+            if fixtures or heavy:
+                return chosen  # only the warm runner serves fixtures / heavy modules cheaply
             out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 60, capture=True)
         try:
             res = json.loads(out.strip().splitlines()[-1])
@@ -1348,10 +1363,12 @@ class Selector:
                 self._imp = False
         return self._imp or None
 
-    def _serve_run(self, patched, ids):
+    def _serve_run(self, patched, ids, fixtures=None):
         """Run through the warm fork server; None if not applicable or anything fails."""
-        plan = self._swap_plan(patched)
-        if not plan:
+        plan = self._swap_plan(patched) if patched else {}
+        if plan is None or (not plan and not fixtures and patched):
+            return None
+        if not plan and not fixtures:
             return None
         try:
             srv = self._server
@@ -1361,7 +1378,8 @@ class Selector:
                 srv = self._server = subprocess.Popen(
                     [sys.executable, str(APP / "runner.py"), "--serve"], cwd="/tmp", env=env, text=True,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            srv.stdin.write(json.dumps({"files": plan, "ids": ids}) + "\n")
+            srv.stdin.write(json.dumps({"files": plan, "ids": ids, "fixtures": fixtures or {}}) + "\n")
+            self._warm_mods.update(t.split("::")[0] for t in ids)
             srv.stdin.flush()
             import select as _select
             ready, _, _ = _select.select([srv.stdout], [], [], 60)

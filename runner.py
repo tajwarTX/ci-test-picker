@@ -141,6 +141,29 @@ def _swap(rel, new_text, changed_qualnames):
     return True
 
 
+def _overlay(files):
+    """Serve patched data files (fixtures) from memory: open()/io.open of exactly those
+    paths returns the patched content; everything else is untouched."""
+    import builtins
+    import io
+
+    real = io.open
+
+    def opener(file, mode="r", *args, **kwargs):
+        try:
+            key = os.path.abspath(os.fspath(file))
+        except TypeError:
+            key = None
+        if key in files and not any(c in mode for c in "wax+"):
+            if "b" in mode:
+                return io.BytesIO(files[key].encode("utf-8"))
+            return io.StringIO(files[key])
+        return real(file, mode, *args, **kwargs)
+
+    builtins.open = opener
+    io.open = opener
+
+
 def serve():
     os.environ["SKIP_INTEGRATION"] = "0"
     cf.ProcessPoolExecutor = SyncExecutor
@@ -161,6 +184,9 @@ def serve():
             os.close(r)
             out = os.fdopen(w, "w")
             try:
+                fx = {os.path.join(SRC, rel): text for rel, text in req.get("fixtures", {}).items()}
+                if fx:
+                    _overlay(fx)
                 ok = all(_swap(rel, d["text"], d["functions"]) for rel, d in req["files"].items())
                 if not ok:
                     out.write(json.dumps({"noswap": True}))
