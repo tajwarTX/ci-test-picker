@@ -412,7 +412,7 @@ if cmp_paths:
           file=sys.stderr)
 
 # ---- and/or profile (bop*.json) -------------------------------------------------------
-bop_out = {}
+bop_out, bop_tests_out = {}, []
 bop_paths = [f for run in run_dirs for f in glob.glob(os.path.join(run, "bop.*.json"))]
 if bop_paths:
     seen_b, inf = set(), {}
@@ -422,13 +422,25 @@ if bop_paths:
         if n is None:
             continue
         seen_b.add(n)
+        if d.get("version") != 2:
+            sys.exit(f"REFUSING TO BUILD: {path} is from the and/or profiler v1 (ignores side effects)")
         for site in d["infected"]:
             inf.setdefault(site, set()).add(n)
-    missing = [t["id"] for t in tests if t["number"] not in seen_b]
+    # the profile may cover only some tests (the heavy ones): exactly those its run log lists
+    profiled = set()
+    for run in run_dirs:
+        if glob.glob(os.path.join(run, "bop.*.json")):
+            log = os.path.join(run, "isolated_log.json")
+            if not os.path.exists(log):
+                sys.exit(f"REFUSING TO BUILD: {run} has and/or data but no isolated_log.json")
+            for r in json.load(open(log)):
+                profiled.add(number[r["id"]])
+    missing = sorted(profiled - seen_b)
     if missing:
-        sys.exit(f"REFUSING TO BUILD: {len(missing)} tests have no and/or data, e.g. {missing[:3]}")
+        sys.exit(f"REFUSING TO BUILD: {len(missing)} profiled tests wrote no and/or data")
     bop_out = {site: sid(ts) for site, ts in inf.items()}
-    print(f"and/or: {len(bop_out)} sites infected by some test", file=sys.stderr)
+    bop_tests_out = sorted(profiled)
+    print(f"and/or: {len(bop_tests_out)} profiled tests, {len(bop_out)} sites infected by one of them", file=sys.stderr)
 
 result = {
     "sets": [list(k) for k in sorted(set_ids, key=set_ids.get)],
@@ -437,6 +449,8 @@ result = {
     "cmp_files": cmp_files_out,
     "cmp_differ": cmp_differ_out,
     "bop_infected": bop_out,
+    "bop_version": 2 if bop_tests_out else 0,
+    "bop_tests": bop_tests_out,
     # keep only real repository paths (the executor compiles generated code under
     # pseudo file names, which the open/compile recorder also sees)
     "opened": {p: sid(s) for p, s in sorted(opened.items()) if os.path.exists(os.path.join(SRC, p))},

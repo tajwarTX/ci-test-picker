@@ -524,6 +524,7 @@ class Selector:
         # site -> tests where and/or swapped could differ. Only maps from the side-effect-aware
         # profiler (bop_version >= 2) are used: version 1 ignored effects of the skipped operand.
         self.bop = mp.get("bop_infected", {}) if mp.get("bop_version", 1) >= 2 else {}
+        self.bop_tests = set(mp.get("bop_tests", ())) if self.bop or mp.get("bop_version", 1) >= 2 else set()
         # per commit
         self.patched: dict = {}
         self.fallback: set = set()
@@ -774,7 +775,7 @@ class Selector:
     def boolop_swaps(self, path, original, new_text, ch):
         """[site] if the ONLY difference is `and` <-> `or` in two-operand BoolOps that were
         profiled; otherwise None."""
-        if not self.bop or path not in self.cmp_files:
+        if not self.bop_tests or path not in self.cmp_files:
             return None
         found = False
         for _, body in ch.hunks:
@@ -894,16 +895,6 @@ class Selector:
             why.append(f"{path}: comparison swap at {len(swaps)} site(s) -> tests where they disagree")
             return out
         bsites = self.boolop_swaps(path, original, new_text, ch)
-        if bsites is not None:
-            # Only `and` <-> `or` swapped: a test is affected only where the swapped
-            # operator could have produced a different value (see the mapper's bopmap).
-            out = set()
-            for site in bsites:
-                sid_ = self.bop.get(site)
-                if sid_ is not None:
-                    out |= self.sets[sid_]
-            why.append(f"{path}: and/or swap at {len(bsites)} site(s) -> tests where it could differ")
-            return out
         chosen = set()
         funcs = info["funcs"]
         stmts = self.stmt_cache.get(path)
@@ -1000,6 +991,20 @@ class Selector:
         why.append(f"{path}: points stmt {kinds.count('stmt')}, func {kinds.count('func')}, "
                    f"class {kinds.count('class')}, setting {kinds.count('setting')}, entry {kinds.count('entry')}, "
                    f"file {kinds.count('file')}")
+        if bsites is not None:
+            # Only `and` <-> `or` swapped. The profiled (heavy) tests are affected only
+            # where the swapped operator could give another value or skip an operand
+            # that has effects (see the mapper's bopmap); every other test keeps the
+            # rules above.
+            infected = set()
+            for site in bsites:
+                sid_ = self.bop.get(site)
+                if sid_ is not None:
+                    infected |= self.sets[sid_]
+            drop = (self.bop_tests - infected) & chosen
+            if drop:
+                chosen -= drop
+                why.append(f"{path}: and/or swap: {len(drop)} profiled test(s) cannot differ -> dropped")
         return chosen
 
     def select_other(self, path: str, why: list) -> set:
