@@ -153,6 +153,171 @@ def main():
     return 2
 
 
+class _StopAtPlan(Exception):
+    pass
+
+
+def _fingerprint(root):
+    """sha256 of everything an expression tree holds (class, every arg, comments, type,
+    meta, position and any other attribute), computed WITHOUT sqlglot code, so a patched
+    sqlglot cannot hide a difference. Iterative (TPC-DS trees are deep). Every stack
+    entry is tagged: 0 value, 1 arg name, 2 end of node, 3 type follows."""
+    h = hashlib.sha256()
+    stack = [(0, root)]
+    n = 0
+    while stack:
+        tag, x = stack.pop()
+        n += 1
+        if n > 20_000_000:
+            raise RuntimeError("tree too large")
+        if tag == 1:
+            h.update(b"|k:" + repr(x).encode())
+            continue
+        if tag == 2:
+            h.update(b">")
+            continue
+        if tag == 3:
+            h.update(b"|t:")
+            stack.append((0, x))
+            continue
+        t = type(x)
+        if "args" in _all_slots(t) and isinstance(getattr(x, "args", None), dict):
+            h.update(f"<{t.__module__}.{t.__qualname__}|{x.arg_key!r}|{x.index!r}|{x.comments!r}".encode())
+            meta = x._meta
+            h.update(repr(sorted((repr(k), repr(v)) for k, v in meta.items()) if meta else meta).encode())
+            for name in sorted(_all_slots(t) - _EXPR_SLOTS):
+                h.update(f"|{name}={getattr(x, name, None)!r}".encode())
+            d = getattr(x, "__dict__", None)
+            if d:
+                h.update(repr(sorted((k, repr(v)) for k, v in d.items())).encode())
+            stack.append((2, None))
+            for k in sorted(x.args, reverse=True):
+                stack.append((0, x.args[k]))
+                stack.append((1, k))
+            stack.append((3, x._type))
+        elif t is list or t is tuple:
+            h.update(f"{'[' if t is list else '('}{len(x)}".encode())
+            stack.extend((0, v) for v in reversed(x))
+        elif t is dict:
+            h.update(f"{{{len(x)}".encode())
+            for k in sorted(x, key=repr, reverse=True):
+                stack.append((0, x[k]))
+                stack.append((1, k))
+        else:
+            h.update(f"({t.__module__}.{t.__qualname__}:{x!r})".encode())
+    return h.hexdigest()
+
+
+_EXPR_SLOTS = {"args", "parent", "arg_key", "index", "comments", "_type", "_meta", "_hash"}
+
+
+def _all_slots(cls):
+    out = set()
+    for c in cls.__mro__:
+        sl = c.__dict__.get("__slots__", ())
+        out.update((sl,) if isinstance(sl, str) else sl)
+    return out
+
+
+def _prep_digest(meta, sql, schema, tables):
+    """What test_execute_tpcds computes BEFORE planning, for one query: the parse + pickle
+    round trip; for executed queries, the real execute() run up to Plan (tables, schema,
+    optimize, the eager `expression.sql(pretty=True)` of its debug log) and the
+    expression it would plan, plus the DuckDB SQL. Execution itself is not run: the
+    selector only uses this when no function the execution stage runs was changed."""
+    from sqlglot import find_tables, parse_one, transpile
+    import sqlglot.executor as ex
+
+    e = pickle.loads(pickle.dumps(parse_one(sql)))
+    if not meta.get("execute"):
+        return "parsed"
+    used = {t.name: tables[t.name] for t in find_tables(e)}
+    got = []
+
+    def stop(expression):
+        got.append(expression)
+        raise _StopAtPlan()
+
+    real = ex.Plan
+    ex.Plan = stop
+    try:
+        ex.execute(e, schema=schema, tables=used)
+    except _StopAtPlan:
+        pass
+    finally:
+        ex.Plan = real
+    if len(got) != 1:
+        raise RuntimeError("execute() did not reach Plan")
+    duck = transpile(sql, write="duckdb")[0]
+    return hashlib.sha256((_fingerprint(got[0]) + "|" + repr(duck) + "|" + repr(sorted(used))).encode()).hexdigest()
+
+
+def prep_main(mode, args):
+    schema, load_pairs = _helpers()
+    sqls = list(load_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+    data = args[0]
+    rows = pickle.load(open(os.path.join(data, "rows.pickle"), "rb"))
+    tables = _Tables(schema, rows)
+    path = os.path.join(data, "prep.json")
+    if mode == "prep-build":
+        res = []
+        for meta, sql, _ in sqls:
+            t0 = time.process_time()
+            d = _prep_digest(meta, sql, schema, tables)
+            res.append({"digest": d, "cpu": round(time.process_time() - t0, 4)})
+        json.dump({"queries": res}, open(path, "w"))
+        print(f"prep: {len(res)} queries, {sum(r['cpu'] for r in res):.1f}s CPU", file=sys.stderr)
+        return 0
+    if mode == "prep-check":
+        doc = json.load(open(path))
+        bad = 0
+        for (meta, sql, _), r in zip(sqls, doc["queries"]):
+            t0 = time.process_time()
+            try:
+                d = _prep_digest(meta, sql, schema, tables)
+            except Exception:
+                d = None
+            r["cpu"] = round(max(r["cpu"], time.process_time() - t0), 4)
+            if d != r["digest"]:
+                r["unstable"] = True
+                bad += 1
+        # a second pass in the same (now warm) process: per-query cost once the one-time
+        # start-up work (lazy imports, caches, tables) is done; "fixed" is that start-up
+        warm_total = 0.0
+        for (meta, sql, _), r in zip(sqls, doc["queries"]):
+            t0 = time.process_time()
+            try:
+                d = _prep_digest(meta, sql, schema, tables)
+            except Exception:
+                d = None
+            r["warm"] = round(time.process_time() - t0, 4)
+            warm_total += r["warm"]
+            if d != r["digest"]:
+                r["unstable"] = True
+                bad += 1
+        doc["fixed"] = round(max(0.0, sum(r["cpu"] for r in doc["queries"]) - warm_total), 4)
+        json.dump(doc, open(path, "w"))
+        print(f"prep unstable queries: {bad}; cold {sum(r['cpu'] for r in doc['queries']):.1f}s "
+              f"warm {warm_total:.1f}s fixed {doc['fixed']:.1f}s", file=sys.stderr)
+        return 0
+    if mode == "prep":
+        want = json.load(open(path))["queries"]
+        if len(sqls) != len(want):
+            return 1
+        for q in map(int, args[1:]):
+            meta, sql, _ = sqls[q]
+            if want[q].get("unstable"):
+                return 1
+            try:
+                d = _prep_digest(meta, sql, schema, tables)
+            except Exception:
+                return 1
+            if d != want[q]["digest"]:
+                return 1
+        return 0
+    return 2
+
+
 TPCH_DIR = os.path.join(SRC, "tests", "fixtures", "optimizer", "tpc-h")
 
 
@@ -286,6 +451,11 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["genmem"]:
         try:
             sys.exit(generator_memory())
+        except Exception:
+            sys.exit(1)
+    if sys.argv[1] in ("prep-build", "prep-check", "prep"):
+        try:
+            sys.exit(prep_main(sys.argv[1], sys.argv[2:]))
         except Exception:
             sys.exit(1)
     if sys.argv[1:2] == ["maxnodes"]:

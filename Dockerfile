@@ -27,10 +27,12 @@ COPY tpc_probe.py /app/tpc_probe.py
 RUN mkdir /app/tpc && cd /tmp \
  && PYTHONPATH=/app/src PYTHONHASHSEED=0 python /app/tpc_probe.py build /app/tpc \
  && PYTHONPATH=/app/src PYTHONHASHSEED=1 python /app/tpc_probe.py check /app/tpc \
+ && PYTHONPATH=/app/src PYTHONHASHSEED=0 python /app/tpc_probe.py prep-build /app/tpc \
+ && PYTHONPATH=/app/src PYTHONHASHSEED=1 python /app/tpc_probe.py prep-check /app/tpc \
  && PYTHONPATH=/app/src PYTHONHASHSEED=0 python /app/tpc_probe.py tpch-build /app/tpc \
  && PYTHONPATH=/app/src PYTHONHASHSEED=1 python /app/tpc_probe.py tpch /app/tpc exec opt \
  && PYTHONPATH=/app/src python /app/tpc_probe.py genmem \
- && test -s /app/tpc/pristine.json && test -s /app/tpc/rows.pickle && test -s /app/tpc/tpch.json
+ && test -s /app/tpc/pristine.json && test -s /app/tpc/prep.json && test -s /app/tpc/rows.pickle && test -s /app/tpc/tpch.json
 COPY runner.py /app/runner.py
 COPY selector.py /app/selector.py
 COPY data/map.json.gz /app/map.json.gz

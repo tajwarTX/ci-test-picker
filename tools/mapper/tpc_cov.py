@@ -98,6 +98,32 @@ elif mode == "equery":
     _ = (result.columns, result.rows)
     cov.stop()
     name = f"e{i:03d}"
+elif mode == "ewarm":
+    # ONE process running the execution stage of every executed query in turn (warm
+    # caches, like a pool worker): lines only a warm run reaches join the execution map
+    import logging
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.planner import Plan
+    import tpc_probe
+
+    schema, load_pairs = tpc_probe._helpers()
+    executed = [int(x) for x in open(os.path.join(out, "executed.txt")).read().split()]
+    rows = {t: tpc_probe._read_rows(t) for t in schema}
+    tables = tpc_probe._Tables(schema, rows)
+    work = []
+    for i in executed:
+        opt, names = pickle.load(open(os.path.join(out, f"opt{i:03d}.pickle"), "rb"))
+        work.append((opt, {t: tables[t] for t in names}))
+    cov.start()
+    for opt, used in work:
+        tables_ = ensure_tables(used)
+        plan = Plan(opt)
+        logging.getLogger("sqlglot").debug("Logical Plan: %s", plan)
+        result = pickle.loads(pickle.dumps(PythonExecutor(tables=tables_).execute(plan)))
+        _ = (result.columns, result.rows)
+    cov.stop()
+    name = "ewarm"
 else:
     i = int(sys.argv[3])
     # import what the test module imports first (that is setup, not this query)

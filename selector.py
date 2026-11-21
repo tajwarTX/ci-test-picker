@@ -326,18 +326,28 @@ class TpcProbe:
     statements and compares them with pristine results recorded at build time."""
 
     BUDGET = 12.0  # most CPU seconds a probe may be expected to cost
+    PREP_BUDGET = 18.0  # the plan check (its build-time estimate is ~2x its real warm cost)
     RUN_LIMIT = 90.0  # no new probe once the whole run has taken this long (limit: 180-270 s)
     OVERHEAD = 1.5  # start-up: interpreter, sqlglot import, table data
 
     def __init__(self, checker, map_path=APP / "tpc_map.json.gz", data=APP / "tpc"):
         self.checker, self.map_path, self.data = checker, map_path, data
         self.loaded = None
+        self.prep, self.e_lines, self.prep_fixed = None, None, None
 
     def _load(self):
         if self.loaded is None:
             try:
                 m = json.load(gzip.open(self.map_path, "rt"))
                 pr = json.load(open(self.data / "pristine.json"))["queries"]
+                try:
+                    doc = json.load(open(self.data / "prep.json"))
+                    self.prep, self.prep_fixed = doc["queries"], doc.get("fixed")
+                    self.e_lines = {r: {l for l, _ in v} for r, v in m["e"].items()}
+                    if len(self.prep) != len(pr):
+                        raise ValueError
+                except Exception:
+                    self.prep, self.e_lines, self.prep_fixed = None, None, None
                 m["base"] = {r: set(v) for r, v in m["base"].items()}
                 m["q"] = {r: dict((l, b) for l, b in v) for r, v in m["q"].items()}
                 m["unmodeled"] = {r: set(v) for r, v in m["unmodeled"].items()}
@@ -370,7 +380,32 @@ class TpcProbe:
     def cost(self, queries):
         return self.OVERHEAD + sum(self.loaded[1][i]["cpu"] for i in queries)
 
-    def run(self, patched, queries, timeout):
+    def prep_cost(self, queries):
+        if not self.prep or any(self.prep[i].get("unstable") for i in queries):
+            return None
+        if self.prep_fixed is not None and all("warm" in self.prep[i] for i in queries):
+            return self.OVERHEAD + self.prep_fixed + sum(self.prep[i]["warm"] for i in queries)
+        return self.OVERHEAD + sum(self.prep[i]["cpu"] for i in queries)
+
+    def prep_eligible(self, ranges, trees):
+        """True if no changed range lies in a function that the execution stage (Plan,
+        PythonExecutor, result shipping, execute() itself) ever runs, for any query,
+        cold or warm. Whole outermost functions count, not just the lines they ran."""
+        if self.e_lines is None:
+            return False
+        for rel, lo, hi in ranges:
+            tree = trees.get(rel)
+            if tree is None:
+                return False
+            fn = _outermost_def(tree, lo, hi)
+            if fn is None:
+                return False
+            e = self.e_lines.get(rel, ())
+            if any(fn.lineno <= l <= fn.end_lineno for l in e):
+                return False
+        return True
+
+    def run(self, patched, queries, timeout, mode="probe"):
         if not queries:
             return True
         c = self.checker
@@ -387,7 +422,7 @@ class TpcProbe:
                        PYTHONHASHSEED="0", TPC_SRC=str(SRC))
             order = sorted(queries, key=lambda i: self.loaded[1][i]["cpu"])
             proc = subprocess.run(
-                [sys.executable, str(APP / "tpc_probe.py"), "probe", str(self.data), *map(str, order)],
+                [sys.executable, str(APP / "tpc_probe.py"), mode, str(self.data), *map(str, order)],
                 cwd="/tmp", env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=timeout,
             )
@@ -399,6 +434,23 @@ class TpcProbe:
                 f = c.work / rel
                 f.write_bytes(data)
                 os.utime(f, ns=(atime, mtime))
+
+
+def _outermost_def(tree, lo, hi):
+    """The outermost function (module-level or a method, through classes) whose body
+    holds lines lo..hi, or None."""
+    def find(stmts):
+        for s in stmts:
+            if not (s.lineno <= lo and hi <= (s.end_lineno or s.lineno)):
+                continue
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return s
+            if isinstance(s, ast.ClassDef):
+                return find(s.body)
+            return None
+        return None
+
+    return find(tree.body)
 
 
 def _run_patched(checker, patched, args, timeout, capture=False):
@@ -1613,6 +1665,18 @@ class Selector:
         cost = self.tpc_probe.cost(qs)
         saving = cost_of(split(chosen, self.durations), self.durations) - \
             cost_of(split(chosen - {self.tpc}, self.durations), self.durations)
+        # cheaper check when the execution stage is untouched: compare what execute()
+        # would plan (and the DuckDB SQL) with pristine, without executing
+        pcost = self.tpc_probe.prep_cost(qs) if saving > 3 else None
+        if pcost is not None and pcost < cost and pcost <= self.tpc_probe.PREP_BUDGET and pcost <= saving - 3 \
+                and self.tpc_probe.prep_eligible(ranges, self.ast_cache):
+            if self.tpc_probe.run(patched, qs, timeout=max(20.0, 4 * pcost), mode="prep"):
+                chosen.discard(self.tpc)
+                why.append(f"TPC-DS plan check: {len(qs)} affected queries plan exactly as pristine "
+                           f"(execution stage untouched) -> drop test_execute_tpcds")
+            else:
+                why.append(f"TPC-DS plan check: {len(qs)} queries, a plan differs -> keep")
+            return
         if cost > self.tpc_probe.BUDGET or cost > saving - 3:
             why.append(f"TPC-DS probe skipped ({len(qs)} queries, ~{cost:.1f}s CPU vs {saving:.1f}s saved)")
             return

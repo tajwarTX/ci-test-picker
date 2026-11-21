@@ -62,6 +62,14 @@ import ast as _ast
 _src = open("/src/sqlglot/executor/__init__.py").read()
 _fn = next(n for n in _ast.walk(_ast.parse(_src)) if isinstance(n, _ast.FunctionDef) and n.name == "execute")
 all_exec = sum(1 << i for i in executed)
+# warm execution stage (one process, every executed query): required
+ew = os.path.join(cov_dir, "ewarm.json")
+if not os.path.exists(ew):
+    sys.exit("REFUSING: no warm execution-stage coverage (ewarm.json)")
+for rel, ls in json.load(open(ew)).items():
+    dd = e.setdefault(rel, {})
+    for l in ls:
+        dd[l] = dd.get(l, 0) | sum(1 << i for i in executed)
 d = e.setdefault("sqlglot/executor/__init__.py", {})
 for l in range(_fn.lineno, _fn.end_lineno + 1):
     d[l] = d.get(l, 0) | all_exec
