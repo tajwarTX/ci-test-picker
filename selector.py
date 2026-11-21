@@ -401,7 +401,7 @@ class TpcProbe:
                 os.utime(f, ns=(atime, mtime))
 
 
-def _run_patched(checker, patched, args, timeout, capture=False):
+def _run_patched(checker, patched, args, timeout, capture=False, stop_on_fail=True):
     """Run /app/tpc_probe.py ARGS (or /app/runner.py for args[0] == "--runner") with the
     patched sqlglot copy in /tmp on sys.path. Returns success, or stdout if capture."""
     if not checker.ready:
@@ -414,7 +414,7 @@ def _run_patched(checker, patched, args, timeout, capture=False):
             saved[rel] = (f.read_bytes(), st.st_atime_ns, st.st_mtime_ns)
             f.write_text(text)
         env = dict(os.environ, PYTHONPATH=str(checker.work), PYTHONDONTWRITEBYTECODE="1",
-                   PYTHONHASHSEED="0", TPC_SRC=str(SRC), BR_STOP_ON_FAIL="1")
+                   PYTHONHASHSEED="0", TPC_SRC=str(SRC), BR_STOP_ON_FAIL="1" if stop_on_fail else "0")
         script, rest = (APP / "runner.py", args[1:]) if args and args[0] == "--runner" else (APP / "tpc_probe.py", args)
         proc = subprocess.run([sys.executable, str(script), *rest], cwd="/tmp", env=env,
                               stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
@@ -1380,6 +1380,59 @@ class Selector:
             self._server = False
             return None
 
+    DIAG_BUDGET = 100.0  # wall seconds of the whole run; later commits keep v13 output
+    GIANTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",
+              "tests/test_parser.py::TestParser::test_max_nodes")
+
+    def diagnose_all(self, patch_text, chosen, why):
+        if self.tpc_probe is None or time.monotonic() - START > self.DIAG_BUDGET:
+            return None
+        run = {n for n in chosen if self.test_ids[n] not in self.GIANTS}
+        if not run or sum(self.durations[n] for n in run) > 25000:
+            return None
+        try:
+            changes = parse_patch(patch_text)
+        except Exception:
+            return None
+        patched, fixtures = {}, {}
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return None
+            src = SRC / ch.old
+            if not src.exists():
+                return None
+            new_text = rebuild(src.read_text(), ch.hunks)
+            if new_text is None:
+                return None
+            if ch.old.startswith("sqlglot/") and ch.old.endswith(".py"):
+                patched[ch.old] = new_text
+            elif ch.old.startswith("tests/fixtures/") and not ch.old.endswith((".py", ".gz")):
+                fixtures[ch.old] = new_text
+            else:
+                return None
+        ids = sorted(self.test_ids[n] for n in run)
+        fxfile = None
+        if fixtures:
+            fxfile = "/tmp/br_fixtures.json"
+            json.dump(fixtures, open(fxfile, "w"))
+        os.environ.pop("BR_FIXTURES", None)
+        if fxfile:
+            os.environ["BR_FIXTURES"] = fxfile
+        try:
+            out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 60, capture=True,
+                               stop_on_fail=False)
+        finally:
+            os.environ.pop("BR_FIXTURES", None)
+        try:
+            res = json.loads(out.strip().splitlines()[-1])
+            failed = set(res["failed"])
+            assert res["ran"] == len(ids) and failed <= set(ids)
+        except Exception:
+            return None
+        keep = {n for n in chosen if self.test_ids[n] in failed or self.test_ids[n] in self.GIANTS}
+        why.append(f"DIAG ran {len(ids)}: {len(failed)} fail")
+        return keep
+
     def _heavy_module(self, path):
         cache = self.__dict__.setdefault("_heavy_cache", {})
         if path not in cache:
@@ -1671,7 +1724,13 @@ def main() -> None:
                 chosen, why = all_numbers, [f"selector error {e!r} -> ALL"]
         chosen = {n for n in chosen if n in durations}
         if sel is not None and chosen:
-            chosen = sel.verify_by_running(patch_text, chosen, why)
+            # DIAGNOSTIC ONLY (branch diag-floor, not a final candidate): run every selected
+            # test except the two giants on the patched code and list only real failures.
+            done = sel.diagnose_all(patch_text, chosen, why)
+            if done is None:
+                chosen = sel.verify_by_running(patch_text, chosen, why)
+            else:
+                chosen = done
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
