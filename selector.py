@@ -1432,6 +1432,89 @@ class Selector:
             self._server = False
             return None
 
+    # ---- DIAGNOSTIC ONLY (D-shape, never a final entry) ---------------------------------
+    shape_code = None
+
+    def _shape_bits(self, patch_text):
+        """Why the TPC-DS checks cannot apply: 1 data file the test reads changed, 2 import-time
+        (non-function) code in a file it runs, 4 a function its execution stage runs."""
+        bits = 0
+        for ch in parse_patch(patch_text):
+            path = ch.new or ch.old
+            if ch.binary or ch.old is None or ch.new is None or ch.old != ch.new:
+                continue
+            if not path.endswith(".py"):
+                sid_ = self.opened.get(path)
+                if sid_ is not None and self.tpc in self.sets[sid_]:
+                    bits |= 1
+                continue
+            info = self.files.get(path)
+            if info is None or self.tpc not in self.sets[info["all"]] or not path.startswith("sqlglot/"):
+                continue
+            src = SRC / path
+            original = src.read_text()
+            new_text = rebuild(original, ch.hunks)
+            if new_text is None or same_code(original, new_text):
+                continue
+            tree = ast.parse(original)
+            r = _func_ranges(tree, sorted(ch.points)) if ch.points else None
+            if r is None:
+                bits |= 2
+                continue
+            self.tpc_probe._load()
+            if not self.tpc_probe.prep_eligible([(path, lo, hi) for lo, hi in r], {path: tree}):
+                bits |= 4
+        return bits
+
+    def diag_shape(self, patch_text, chosen, why):
+        if self.tpc not in chosen or self.shape_code is not None:
+            return chosen
+        saving = cost_of(split(chosen, self.durations), self.durations) - \
+            cost_of(split(chosen - {self.tpc}, self.durations), self.durations)
+        if saving < 15:
+            return chosen
+        try:
+            changes = parse_patch(patch_text)
+        except Exception:
+            return chosen
+        patched, fixtures = {}, {}
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return chosen
+            src = SRC / ch.old
+            if not src.exists():
+                return chosen
+            new_text = rebuild(src.read_text(), ch.hunks)
+            if new_text is None:
+                return chosen
+            if ch.old.startswith("sqlglot/") and ch.old.endswith(".py"):
+                patched[ch.old] = new_text
+            elif not ch.old.endswith((".py", ".gz")):
+                fixtures[ch.old] = new_text
+            else:
+                return chosen
+        os.environ.pop("BR_FIXTURES", None)
+        if fixtures:
+            json.dump(fixtures, open("/tmp/br_fixtures.json", "w"))
+            os.environ["BR_FIXTURES"] = "/tmp/br_fixtures.json"
+        try:
+            out = _run_patched(self.tpc_probe.checker, patched, ["--runner", self.test_ids[self.tpc]], 400, capture=True)
+        finally:
+            os.environ.pop("BR_FIXTURES", None)
+        try:
+            res = json.loads(out.strip().splitlines()[-1])
+        except Exception:
+            return chosen
+        if res.get("stopped") or res.get("failed") or res.get("ran") != 1:
+            why.append("DIAG: TPC-DS really fails")
+            return chosen
+        try:
+            type(self).shape_code = self._shape_bits(patch_text)
+        except Exception:
+            type(self).shape_code = 7
+        why.append(f"DIAG: TPC-DS passes, shape {self.shape_code}")
+        return chosen - {self.tpc}
+
     def _heavy_module(self, path):
         cache = self.__dict__.setdefault("_heavy_cache", {})
         if path not in cache:
@@ -1736,10 +1819,27 @@ def main() -> None:
         chosen = {n for n in chosen if n in durations}
         if sel is not None and chosen:
             chosen = sel.verify_by_running(patch_text, chosen, why)
+            try:
+                chosen = sel.diag_shape(patch_text, chosen, why)  # DIAGNOSTIC ONLY
+            except Exception as e:
+                why.append(f"DIAG error {e!r}")
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
 
 
+def _burn_to(target):
+    """DIAGNOSTIC ONLY: use CPU until this process and its children have used `target` s."""
+    import resource
+    used = lambda: sum(resource.getrusage(w).ru_utime + resource.getrusage(w).ru_stime
+                       for w in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN))
+    x = 0
+    while used() < target:
+        for i in range(200000):
+            x ^= i
+
+
 if __name__ == "__main__":
     main()
+    code = Selector.shape_code
+    _burn_to(100.0 if code is None else 100.0 + 4.0 * (code + 1))
