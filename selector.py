@@ -1292,6 +1292,7 @@ def split(numbers, durations):
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    tests_by_num = {t["number"]: t["id"] for t in tests}
     all_numbers = set(durations)
     try:
         if MAP_PICKLE.exists():
@@ -1315,6 +1316,9 @@ def main() -> None:
             except Exception as e:
                 chosen, why = all_numbers, [f"selector error {e!r} -> ALL"]
         chosen = {n for n in chosen if n in durations}
+        # DIAGNOSTIC BUILD ONLY (branch diag-no-heavy): drop every test of >= 1 s except
+        # test_execute_tpcds, to measure their waste on the practice set. NOT a final candidate.
+        chosen -= {n for n in chosen if durations[n] >= 1000 and tests_by_num[n] != "tests/test_executor.py::TestExecutor::test_execute_tpcds"}
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
