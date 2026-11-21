@@ -354,6 +354,9 @@ class TpcProbe:
             return None
         return out
 
+    def run_max(self, patched):
+        return _run_patched(self.checker, patched, ["maxnodes"], timeout=30)
+
     def cost(self, queries):
         return self.OVERHEAD + sum(self.loaded[1][i]["cpu"] for i in queries)
 
@@ -386,6 +389,31 @@ class TpcProbe:
                 f = c.work / rel
                 f.write_bytes(data)
                 os.utime(f, ns=(atime, mtime))
+
+
+def _run_patched(checker, patched, args, timeout):
+    """Run /app/tpc_probe.py ARGS with the patched sqlglot copy in /tmp on sys.path."""
+    if not checker.ready:
+        checker._setup()
+    saved = {}
+    try:
+        for rel, text in patched.items():
+            f = checker.work / rel
+            st = f.stat()
+            saved[rel] = (f.read_bytes(), st.st_atime_ns, st.st_mtime_ns)
+            f.write_text(text)
+        env = dict(os.environ, PYTHONPATH=str(checker.work), PYTHONDONTWRITEBYTECODE="1",
+                   PYTHONHASHSEED="0", TPC_SRC=str(SRC))
+        proc = subprocess.run([sys.executable, str(APP / "tpc_probe.py"), *args], cwd="/tmp", env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+        return proc.returncode == 0
+    except Exception:
+        return False
+    finally:
+        for rel, (data, atime, mtime) in saved.items():
+            f = checker.work / rel
+            f.write_bytes(data)
+            os.utime(f, ns=(atime, mtime))
 
 
 def _blocks(s):
@@ -519,6 +547,9 @@ class Selector:
             tpc_probe = TpcProbe(self.import_check)
         self.tpc_probe = tpc_probe
         self.tpc = tpc[0] if tpc and tpc_probe is not None else None
+        mx = [t["number"] for t in tests if t["id"] == "tests/test_parser.py::TestParser::test_max_nodes"]
+        self.max_test = mx[0] if mx and tpc_probe is not None else None
+        self._max_map = None
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
         self.cmp_files = set(mp.get("cmp_files", ()))  # files whose comparisons were profiled
         # site -> tests where and/or swapped could differ. Only maps from the side-effect-aware
@@ -1066,11 +1097,56 @@ class Selector:
                 return chosen, why  # never probe a package that does not import
         if self.tpc is not None and self.tpc in chosen:
             self.try_tpc_probe(changes, chosen, why)
+        if self.max_test is not None and self.max_test in chosen:
+            self.try_max_probe(changes, chosen, why)
         return chosen, why
+
+    def try_max_probe(self, changes, chosen, why):
+        """Drop test_max_nodes when the change touches no line its two huge parses (or the
+        imports before them) run, and its four cheap checks pass on the patched code."""
+        got = self._probe_inputs(changes, self.max_test)
+        if got is None:
+            return
+        patched, ranges = got
+        m = self.max_map()
+        if not m:
+            return
+        for rel, lo, hi in ranges:
+            huge, unm = m["huge"].get(rel, ()), m["unmodeled"].get(rel, ())
+            if any(l in huge or l in unm for l in range(lo, hi + 1)):
+                return
+        saving = cost_of(split(chosen, self.durations), self.durations) - \
+            cost_of(split(chosen - {self.max_test}, self.durations), self.durations)
+        if saving < 3:
+            return
+        if self.tpc_probe.run_max(patched):
+            chosen.discard(self.max_test)
+            why.append("test_max_nodes: change outside its huge parses; cheap checks pass -> drop test_max_nodes")
+        else:
+            why.append("test_max_nodes: cheap checks fail -> keep")
+
+    def max_map(self):
+        if self._max_map is None:
+            try:
+                m = json.load(gzip.open(APP / "max_map.json.gz", "rt"))
+                self._max_map = {k: {r: set(v) for r, v in m[k].items()} for k in ("huge", "unmodeled")}
+            except Exception:
+                self._max_map = False
+        return self._max_map
 
     def try_tpc_probe(self, changes, chosen, why):
         """Drop test_execute_tpcds when re-running its affected queries on the patched code
         gives exactly the pristine results (see TpcProbe)."""
+        got = self._probe_inputs(changes, self.tpc)
+        if got is None:
+            return
+        patched, ranges = got
+        self._tpc_probe_ranges(patched, ranges, chosen, why)
+
+    def _probe_inputs(self, changes, test):
+        """(patched files, changed line ranges inside function bodies) for a probe of one
+        test, or None if the change is not of that kind. Files the test never runs or
+        opens, and comment-only edits, are left out."""
         patched, ranges = {}, []
         for ch in changes:
             if ch.binary or ch.old is None or ch.old != ch.new:
@@ -1081,7 +1157,7 @@ class Selector:
                 if path.rsplit("/", 1)[-1] in PYTEST_FILES | PYTEST_SECTION_FILES:
                     return
                 sid_ = self.opened.get(path)
-                if sid_ is not None and self.tpc in self.sets[sid_]:
+                if sid_ is not None and test in self.sets[sid_]:
                     return
                 if sid_ is None and path.startswith(("sqlglot/", "tests/")):
                     return  # never seen: be careful
@@ -1089,7 +1165,7 @@ class Selector:
             info = self.files.get(path)
             if info is None or not path.startswith(("sqlglot/", "tests/")):
                 return
-            if self.tpc not in self.sets[info["all"]]:
+            if test not in self.sets[info["all"]]:
                 continue  # the TPC-DS test never ran a line of this file (not even its import)
             if not path.startswith("sqlglot/"):
                 return
@@ -1117,7 +1193,10 @@ class Selector:
             ranges += [(path, lo, hi) for lo, hi in r]
             patched[path] = new_text
         if not ranges:
-            return
+            return None
+        return patched, ranges
+
+    def _tpc_probe_ranges(self, patched, ranges, chosen, why):
         qs = self.tpc_probe.affected(ranges)
         if qs is None:
             return

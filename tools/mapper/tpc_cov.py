@@ -49,6 +49,55 @@ if mode == "baseline":
     list(load_pairs("optimizer/tpc-ds/tpc-ds.sql"))
     cov.stop()
     name = "baseline"
+elif mode == "prep":
+    # pristine: the optimized expression execute() would plan, saved for "equery"
+    i = int(sys.argv[3])
+    import tpc_probe
+    import sqlglot.executor as ex
+    from sqlglot import find_tables, parse_one
+
+    schema, load_pairs = tpc_probe._helpers()
+    meta, sql, _ = list(load_pairs("optimizer/tpc-ds/tpc-ds.sql"))[i]
+    rows = {t: tpc_probe._read_rows(t) for t in schema}
+    tables = tpc_probe._Tables(schema, rows)
+    e = pickle.loads(pickle.dumps(parse_one(sql)))
+    used = {t.name: tables[t.name] for t in find_tables(e)}
+    got = []
+
+    def stop(expression):
+        got.append(expression)
+        raise tpc_probe._StopAtPlan()
+
+    ex.Plan = stop
+    try:
+        ex.execute(e, schema=schema, tables=used)
+    except tpc_probe._StopAtPlan:
+        pass
+    pickle.dump((got[0], sorted(used)), open(os.path.join(out, f"opt{i:03d}.pickle"), "wb"))
+    sys.exit(0)
+elif mode == "equery":
+    # a FRESH process (caches cold): lines that planning + execution + shipping the
+    # result back run for query I, starting from its pristine optimized expression
+    i = int(sys.argv[3])
+    import logging
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.planner import Plan
+    import tpc_probe
+
+    schema, load_pairs = tpc_probe._helpers()
+    opt, names = pickle.load(open(os.path.join(out, f"opt{i:03d}.pickle"), "rb"))
+    rows = {t: tpc_probe._read_rows(t) for t in names}
+    tables = tpc_probe._Tables(schema, rows)
+    used = {t: tables[t] for t in names}
+    cov.start()
+    tables_ = ensure_tables(used)
+    plan = Plan(opt)
+    logging.getLogger("sqlglot").debug("Logical Plan: %s", plan)
+    result = pickle.loads(pickle.dumps(PythonExecutor(tables=tables_).execute(plan)))
+    _ = (result.columns, result.rows)
+    cov.stop()
+    name = f"e{i:03d}"
 else:
     i = int(sys.argv[3])
     # import what the test module imports first (that is setup, not this query)

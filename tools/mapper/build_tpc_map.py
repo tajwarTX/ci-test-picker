@@ -44,11 +44,34 @@ for rel, ls in real.items():
     extra = ls - base.get(rel, set()) - set(q.get(rel, {}))
     if extra:
         unmodeled[rel] = sorted(extra)
+# execution phase (Plan + PythonExecutor + result shipping), per executed query, measured
+# in fresh processes; plus every line of executor.execute() itself, for every query
+executed = [int(x) for x in open(os.path.join(cov_dir, "executed.txt")).read().split()]
+e = {}
+n_e = 0
+for i in executed:
+    f = os.path.join(cov_dir, f"e{i:03d}.json")
+    if not os.path.exists(f):
+        sys.exit(f"REFUSING: no execution-phase coverage for query {i}")
+    n_e += 1
+    for rel, ls in json.load(open(f)).items():
+        d = e.setdefault(rel, {})
+        for l in ls:
+            d[l] = d.get(l, 0) | (1 << i)
+import ast as _ast
+_src = open("/src/sqlglot/executor/__init__.py").read()
+_fn = next(n for n in _ast.walk(_ast.parse(_src)) if isinstance(n, _ast.FunctionDef) and n.name == "execute")
+all_exec = sum(1 << i for i in executed)
+d = e.setdefault("sqlglot/executor/__init__.py", {})
+for l in range(_fn.lineno, _fn.end_lineno + 1):
+    d[l] = d.get(l, 0) | all_exec
 res = {"base": {r: sorted(v) for r, v in base.items()},
+       "e": {r: sorted([l, m] for l, m in dd.items()) for r, dd in e.items()},
+       "executed": executed,
        "q": {r: sorted([l, m] for l, m in d.items()) for r, d in q.items()},
        "unmodeled": unmodeled}
 with gzip.open(out, "wt") as f:
     json.dump(res, f, separators=(",", ":"))
 tot_real = sum(len(v) for v in real.values())
-print(f"queries {n}; real TPC-DS lines {tot_real}; unmodeled {sum(len(v) for v in unmodeled.values())} "
+print(f"execution-phase coverage for {n_e} queries; queries {n}; real TPC-DS lines {tot_real}; unmodeled {sum(len(v) for v in unmodeled.values())} "
       f"in {len(unmodeled)} files; size {os.path.getsize(out)/1e6:.2f} MB")

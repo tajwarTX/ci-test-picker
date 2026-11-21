@@ -153,5 +153,31 @@ def main():
     return 2
 
 
+def max_nodes_cheap():
+    """The four cheap checks of tests/test_parser.py::TestParser::test_max_nodes, in the
+    test's order, on the sqlglot from PYTHONPATH. Its two huge parses are not run: the
+    selector uses this only when the change touches no line they (or imports) run."""
+    from sqlglot import ParseError, exp, parse_one
+
+    if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+        return 1
+    cols = [f"col{i}" for i in range(500)]
+    if not isinstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select):
+        return 1
+    try:
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+        return 1
+    except ParseError:
+        pass
+    if not isinstance(parse_one("SELECT 1, 2, 3"), exp.Select):
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["maxnodes"]:
+        try:
+            sys.exit(max_nodes_cheap())
+        except Exception:
+            sys.exit(1)
     sys.exit(main())
