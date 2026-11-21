@@ -7,12 +7,15 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 # each patch to it to check the changed files still compile and import.
 ADD https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz /tmp/sqlglot.tar.gz
 RUN mkdir -p /app/src \
- && tar xzf /tmp/sqlglot.tar.gz -C /app/src --strip-components=1 --wildcards '*.py' '*.toml' '*.cfg' '*/tests/fixtures/optimizer/tpc-ds/*' '*/tests/fixtures/optimizer/tpc-h/*' \
+ && tar xzf /tmp/sqlglot.tar.gz -C /app/src --strip-components=1 --wildcards '*.py' '*.toml' '*.cfg' '*/tests/fixtures/*' \
  && rm /tmp/sqlglot.tar.gz \
  && test -f /app/src/sqlglot/parser.py
 
 # Bytecode for the pristine tree (so run-time import checks only compile patched
 # files) and the list of modules that import cleanly at the pinned commit.
+# the tests' own third-party dependencies, pinned as in requirements.lock (PyPI): the
+# runner executes real tests on the patched code
+RUN pip install --no-cache-dir duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 pytz==2026.6 python-dateutil==4.0.0 tzdata==2026.6
 COPY importcheck.py /app/importcheck.py
 RUN python -m compileall -q /app/src/sqlglot \
  && PYTHONPATH=/app/src python /app/importcheck.py --baseline /app/import_ok.json \
@@ -28,6 +31,7 @@ RUN mkdir /app/tpc && cd /tmp \
  && PYTHONPATH=/app/src PYTHONHASHSEED=1 python /app/tpc_probe.py tpch /app/tpc exec opt \
  && PYTHONPATH=/app/src python /app/tpc_probe.py genmem \
  && test -s /app/tpc/pristine.json && test -s /app/tpc/rows.pickle && test -s /app/tpc/tpch.json
+COPY runner.py /app/runner.py
 COPY selector.py /app/selector.py
 COPY data/map.json.gz /app/map.json.gz
 COPY data/tpc_map.json.gz /app/tpc_map.json.gz

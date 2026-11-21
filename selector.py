@@ -401,8 +401,9 @@ class TpcProbe:
                 os.utime(f, ns=(atime, mtime))
 
 
-def _run_patched(checker, patched, args, timeout):
-    """Run /app/tpc_probe.py ARGS with the patched sqlglot copy in /tmp on sys.path."""
+def _run_patched(checker, patched, args, timeout, capture=False):
+    """Run /app/tpc_probe.py ARGS (or /app/runner.py for args[0] == "--runner") with the
+    patched sqlglot copy in /tmp on sys.path. Returns success, or stdout if capture."""
     if not checker.ready:
         checker._setup()
     saved = {}
@@ -413,12 +414,16 @@ def _run_patched(checker, patched, args, timeout):
             saved[rel] = (f.read_bytes(), st.st_atime_ns, st.st_mtime_ns)
             f.write_text(text)
         env = dict(os.environ, PYTHONPATH=str(checker.work), PYTHONDONTWRITEBYTECODE="1",
-                   PYTHONHASHSEED="0", TPC_SRC=str(SRC))
-        proc = subprocess.run([sys.executable, str(APP / "tpc_probe.py"), *args], cwd="/tmp", env=env,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+                   PYTHONHASHSEED="0", TPC_SRC=str(SRC), BR_STOP_ON_FAIL="1")
+        script, rest = (APP / "runner.py", args[1:]) if args and args[0] == "--runner" else (APP / "tpc_probe.py", args)
+        proc = subprocess.run([sys.executable, str(script), *rest], cwd="/tmp", env=env,
+                              stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=timeout, text=True)
+        if capture:
+            return proc.stdout if proc.returncode == 0 else ""
         return proc.returncode == 0
     except Exception:
-        return False
+        return "" if capture else False
     finally:
         for rel, (data, atime, mtime) in saved.items():
             f = checker.work / rel
@@ -591,6 +596,7 @@ class Selector:
         self.max_test = mx[0] if mx and tpc_probe is not None else None
         self._max_map = None
         self._grpa_map = None
+        self.test_ids = {t["number"]: t["id"] for t in tests}
         self.whole_tests = {t["number"]: t["id"] for t in tests if t["id"] in self.WHOLE} \
             if tpc_probe is not None else {}
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
@@ -1214,6 +1220,68 @@ class Selector:
              "tests/test_generator.py::TestGenerator::test_generator_memory": ("genmem", None)}
     WHOLE_COST = {"tpch": 1.0, "genmem": 2.5}  # measured 0.73 s / 2.06 s CPU, plus margin
 
+    RUN_MAX_TEST = 1.0  # only tests recorded at <= 1 s are run here
+    RUN_MAX_TOTAL = 3.0  # and at most this many recorded seconds per commit
+    RUN_OVERHEAD = 1.2  # interpreter + sqlglot + test-module imports (CPU s)
+
+    def verify_by_running(self, patch_text, chosen, why):
+        """Run the selected tests on the patched code here and list only those that fail
+        (all of them pass -> none). Only for small, cheap selections where the 2 s worker
+        fee dominates; any doubt keeps the full list."""
+        if self.tpc_probe is None or time.monotonic() - START > TpcProbe.RUN_LIMIT:
+            return chosen
+        secs = {n: self.durations[n] / 1000 for n in chosen}
+        if max(secs.values()) > self.RUN_MAX_TEST or sum(secs.values()) > self.RUN_MAX_TOTAL:
+            return chosen
+        full = cost_of(split(chosen, self.durations), self.durations)
+        # measured: ~0.35 s start + sqlglot, ~0.15 s per test module, ~1.4 s more for a
+        # module importing pandas/duckdb, and ~1.6x the recorded test seconds
+        mods = {self.test_ids[n].split("::")[0] for n in chosen}
+        if any(self._heavy_module(m) for m in mods):
+            return chosen  # pandas/duckdb imports alone cost ~1.4 s: rarely pays
+        est = 0.35 + 0.15 * len(mods) + 1.6 * sum(secs.values())
+        if full - est < 0.6:
+            return chosen
+        try:
+            changes = parse_patch(patch_text)
+        except Exception:
+            return chosen
+        patched = {}
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new or not ch.old.startswith("sqlglot/") \
+                    or not ch.old.endswith(".py"):
+                return chosen  # tests, fixtures, other files: not handled here
+            src = SRC / ch.old
+            if not src.exists():
+                return chosen
+            new_text = rebuild(src.read_text(), ch.hunks)
+            if new_text is None:
+                return chosen
+            patched[ch.old] = new_text
+        ids = sorted(self.test_ids[n] for n in chosen)
+        out = _run_patched(self.tpc_probe.checker, patched, ["--runner", *ids], 60, capture=True)
+        try:
+            res = json.loads(out.strip().splitlines()[-1])
+            if res.get("stopped"):
+                why.append(f"ran selected tests here: one fails -> keep all {len(ids)}")
+                return chosen
+            failed = set(res["failed"])
+            assert res["ran"] == len(ids) and failed <= set(ids) and not failed
+        except Exception:
+            return chosen
+        why.append(f"ran {len(ids)} selected tests here: all pass -> none")
+        return set()
+
+    def _heavy_module(self, path):
+        cache = self.__dict__.setdefault("_heavy_cache", {})
+        if path not in cache:
+            try:
+                text = (SRC / path).read_text()
+                cache[path] = "import duckdb" in text or "import pandas" in text or "from pandas" in text
+            except Exception:
+                cache[path] = True
+        return cache[path]
+
     def try_whole_probes(self, changes, chosen, why):
         """Drop TPC-H / generator-memory tests when re-running their whole sqlglot part on
         the patched code (fresh process, patched package imported) gives the pristine
@@ -1484,14 +1552,18 @@ def main() -> None:
         log(f"map failed to load ({e!r}); running everything")
         sel = None
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        patch_text = ""
         if sel is None:
             chosen, why = all_numbers, ["no map -> ALL"]
         else:
             try:
-                chosen, why = sel.select(patch.read_text(errors="replace"))
+                patch_text = patch.read_text(errors="replace")
+                chosen, why = sel.select(patch_text)
             except Exception as e:
                 chosen, why = all_numbers, [f"selector error {e!r} -> ALL"]
         chosen = {n for n in chosen if n in durations}
+        if sel is not None and chosen:
+            chosen = sel.verify_by_running(patch_text, chosen, why)
         workers = split(chosen, durations)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers | " + "; ".join(why))
