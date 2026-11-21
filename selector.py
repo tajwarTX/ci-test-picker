@@ -158,6 +158,8 @@ def rebuild(original: str, hunks) -> "str | None":
 
 
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=]")
+# what comparison_swaps' pre-filter removes before comparing an old and a new line
+_CMP_STRIP = re.compile(r"\s+|==|!=|<=|>=|<|>|\bis\b|\bnot\b")
 
 
 def _tokens(text: str):
@@ -167,6 +169,38 @@ def _tokens(text: str):
     skip = (tokenize.COMMENT, tokenize.NL, tokenize.ENCODING)
     return [(t.type, t.string) for t in tokenize.generate_tokens(io.StringIO(text).readline)
             if t.type not in skip]
+
+
+_CMP_OPNAME = {"==": "Eq", "!=": "NotEq", "<": "Lt", "<=": "LtE", ">": "Gt", ">=": "GtE",
+               "is": "Is", "is not": "IsNot"}
+
+
+def _cmp_tokens(text: str):
+    """[(type, string, (row, col))] for every token except ENCODING, with `is` directly
+    followed by `not` merged into one "is not" token (Python's `is not` operator)."""
+    import io
+    import tokenize
+
+    out = []
+    for t in tokenize.generate_tokens(io.StringIO(text).readline):
+        if t.type == tokenize.ENCODING:
+            continue
+        if t.type == tokenize.NAME and t.string == "not" and out and out[-1][0] == tokenize.NAME \
+                and out[-1][1] == "is":
+            out[-1] = (tokenize.OP, "is not", out[-1][2])
+            continue
+        out.append((t.type, t.string, t.start))
+    return out
+
+
+def _positioned_children(node):
+    """Child nodes that carry source positions; unpositioned ones (comprehension,
+    arguments, withitem, match_case, ...) are looked through."""
+    for c in ast.iter_child_nodes(node):
+        if getattr(c, "end_lineno", None) is not None and getattr(c, "lineno", None) is not None:
+            yield c
+        else:
+            yield from _positioned_children(c)
 
 
 def same_code(old: str, new: str) -> bool:
@@ -328,6 +362,7 @@ class Selector:
             self.container_index.setdefault(c["file"], []).append((c["start"], c["end"], cid))
         self.ast_cache: dict = {}
         self.dump_cache: dict = {}
+        self.tok_cache: dict = {}
         self.cmp_differ = mp.get("cmp_differ", {})  # site -> {partner op: tests}
         self.cmp_files = set(mp.get("cmp_files", ()))  # files whose comparisons were profiled
         # per commit
@@ -436,40 +471,76 @@ class Selector:
         comparisons that were profiled; otherwise None."""
         if path not in self.cmp_files:
             return None
-        ops_text = (" is ", "==", "!=", "<", ">")
-        if not any(l[:1] in "+-" and any(o in l for o in ops_text) for _, body in ch.hunks for l in body):
+        # Cheap text pre-filter (it can only send the change to the normal rules): every
+        # hunk must replace lines one-for-one, and each pair must be identical once
+        # comparison operators, `is`/`not` and spacing are removed.
+        found_op = False
+        for _, body in ch.hunks:
+            minus = [l[1:] for l in body if l[:1] == "-"]
+            plus = [l[1:] for l in body if l[:1] == "+"]
+            if len(minus) != len(plus):
+                return None
+            for a, b in zip(minus, plus):
+                if a == b:
+                    continue
+                if _CMP_STRIP.sub("", a) != _CMP_STRIP.sub("", b):
+                    return None
+                found_op = True
+        if not found_op:
             return None
+        if "\r" in original or "\r" in new_text:
+            return None
+        # Proof, step 1: the token streams are identical except for comparison-operator
+        # tokens replaced by a partner. All comparison operators sit at the same place in
+        # Python's grammar, so the two programs then parse to the same tree except for
+        # those operators.
         try:
+            old_toks = self.tok_cache.get(path)
+            if old_toks is None:
+                old_toks = self.tok_cache[path] = _cmp_tokens(original)
+            new_toks = _cmp_tokens(new_text)
             old_tree = self.ast_cache.get(path)
             if old_tree is None:
                 old_tree = self.ast_cache[path] = ast.parse(original)
-            new_tree = ast.parse(new_text)
-        except SyntaxError:
+        except Exception:
             return None
-        old_nodes, new_nodes = list(ast.walk(old_tree)), list(ast.walk(new_tree))
-        if len(old_nodes) != len(new_nodes):
+        if len(old_toks) != len(new_toks):
             return None
-        swaps, restore = [], []
-        for a, b in zip(old_nodes, new_nodes):
-            if isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop):
-                continue  # the operator objects themselves; checked on their Compare
-            if type(a) is not type(b):
+        changed = []
+        for (ka, sa, pa), (kb, sb, _) in zip(old_toks, new_toks):
+            if sa == sb and ka == kb:
+                continue
+            oa, ob = _CMP_OPNAME.get(sa), _CMP_OPNAME.get(sb)
+            if oa is None or ob is None or ob not in self.CMP_PARTNERS[oa]:
                 return None
-            if isinstance(a, ast.Compare) and len(a.ops) == len(b.ops) == 1 \
-                    and type(a.ops[0]) is not type(b.ops[0]):
-                old_op, new_op = type(a.ops[0]).__name__, type(b.ops[0]).__name__
-                if new_op not in self.CMP_PARTNERS.get(old_op, ()):
-                    return None
-                swaps.append((f"{path}:{a.lineno}:{a.col_offset}", new_op))
-                restore.append((b, b.ops))
-                b.ops = a.ops
-        if not swaps:
+            changed.append((pa, oa, ob))
+        if not changed:
             return None
-        same = self.dump_cache.get(path)
-        if same is None:
-            same = self.dump_cache[path] = ast.dump(old_tree, include_attributes=False)
-        equal = same == ast.dump(new_tree, include_attributes=False)
-        return swaps if equal else None
+        # Step 2: each changed token must be THE operator of a single-operator Compare
+        # in the original file (the kind the profiler rewrote): find it by walking down
+        # the tree to the innermost node whose span holds the token.
+        lines = original.split("\n")
+        swaps, seen = [], set()
+        for (row, col), oa, ob in changed:
+            pos = (row, len(lines[row - 1][:col].encode("utf-8")))  # ast columns are bytes
+            node = old_tree
+            while True:
+                for c in _positioned_children(node):
+                    if (c.lineno, c.col_offset) <= pos < (c.end_lineno, c.end_col_offset):
+                        node = c
+                        break
+                else:
+                    break
+            if not isinstance(node, ast.Compare) or len(node.ops) != 1 or id(node) in seen:
+                return None
+            left, right = node.left, node.comparators[0]
+            if not ((left.end_lineno, left.end_col_offset) <= pos < (right.lineno, right.col_offset)):
+                return None
+            if type(node.ops[0]).__name__ != oa:
+                return None
+            seen.add(id(node))
+            swaps.append((f"{path}:{node.lineno}:{node.col_offset}", ob))
+        return swaps
 
     def whole_file(self, path):
         info = self.files.get(path)

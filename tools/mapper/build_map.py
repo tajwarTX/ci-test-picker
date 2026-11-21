@@ -376,7 +376,7 @@ if ceu_files:
 cmp_files_out, cmp_differ_out = [], {}
 cmp_paths = [f for run in run_dirs for f in glob.glob(os.path.join(run, "cmp.*.json"))]
 if cmp_paths:
-    seen_c = set()
+    seen_c, tainted_c = set(), set()
     differ: dict = {}
     hit_files = set()
     for path in cmp_paths:
@@ -385,6 +385,8 @@ if cmp_paths:
         if n is None:
             continue
         seen_c.add(n)
+        if d.get("tainted", True):
+            tainted_c.add(d["test"])
         for site in d["hit"]:
             hit_files.add(site.rsplit(":", 2)[0])
         for site, ops in d["differ"].items():
@@ -393,6 +395,8 @@ if cmp_paths:
     missing = [t["id"] for t in tests if t["number"] not in seen_c]
     if missing:
         sys.exit(f"REFUSING TO BUILD: {len(missing)} tests have no comparison data, e.g. {missing[:3]}")
+    if tainted_c:
+        sys.exit(f"REFUSING TO BUILD: {len(tainted_c)} tests changed global state while probing, e.g. {sorted(tainted_c)[:3]}")
     # every sqlglot module is loaded through the profiler, so every sqlglot file counts
     cmp_files_out = sorted(r for r in line_tests if r.startswith("sqlglot/"))
     cmp_differ_out = {site: {op: sid(ts) for op, ts in ops.items()} for site, ops in differ.items()}
