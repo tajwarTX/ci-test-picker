@@ -334,6 +334,7 @@ class TpcProbe:
         self.checker, self.map_path, self.data = checker, map_path, data
         self.loaded = None
         self.prep, self.e_lines, self.prep_fixed = None, None, None
+        self.euse, self.euse_names = None, None
 
     def _load(self):
         if self.loaded is None:
@@ -344,10 +345,12 @@ class TpcProbe:
                     doc = json.load(open(self.data / "prep.json"))
                     self.prep, self.prep_fixed = doc["queries"], doc.get("fixed")
                     self.e_lines = {r: {l for l, _ in v} for r, v in m["e"].items()}
+                    self.euse, self.euse_names = set(m["euse"]), set(m["euse_names"])
                     if len(self.prep) != len(pr):
                         raise ValueError
                 except Exception:
                     self.prep, self.e_lines, self.prep_fixed = None, None, None
+                    self.euse, self.euse_names = None, None
                 m["base"] = {r: set(v) for r, v in m["base"].items()}
                 m["q"] = {r: dict((l, b) for l, b in v) for r, v in m["q"].items()}
                 m["unmodeled"] = {r: set(v) for r, v in m["unmodeled"].items()}
@@ -434,6 +437,72 @@ class TpcProbe:
                 f = c.work / rel
                 f.write_bytes(data)
                 os.utime(f, ns=(atime, mtime))
+
+
+def _locate(tree, line):
+    """Where `line` sits: ("func", outermost def, [class names..., def name]) for a line in a
+    function body; ("class", statement or None, [class names]) for class-level code;
+    ("module", statement, None) for module-level code (class/def headers count as code of
+    the block holding them)."""
+    def find(stmts, chain):
+        for st in stmts:
+            first = min([d.lineno for d in getattr(st, "decorator_list", [])] + [st.lineno])
+            if not first <= line <= (st.end_lineno or st.lineno):
+                continue
+            inner = isinstance(st, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                st.body and st.body[0].lineno <= line
+            if isinstance(st, ast.ClassDef) and inner:
+                return find(st.body, chain + [st.name]) or ("class", None, chain + [st.name])
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and inner:
+                return ("func", st, chain + [st.name])
+            return ("class", st, chain) if chain else ("module", st, None)
+        return None
+
+    return find(tree.body, []) or ("module", None, None)
+
+
+def _find_def(tree, qual):
+    """The def at qualified path [class..., name] in tree, or None."""
+    stmts, node = tree.body, None
+    for i, name in enumerate(qual):
+        last = i == len(qual) - 1
+        node = next((st for st in stmts if getattr(st, "name", None) == name and
+                     isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef) if last else ast.ClassDef)), None)
+        if node is None:
+            return None
+        stmts = node.body
+    return node
+
+
+def _declaration(st):
+    """A class-level statement that only binds names in the class namespace."""
+    if st is None or isinstance(st, ast.Pass):
+        return True
+    if isinstance(st, ast.Assign):
+        return all(isinstance(t, ast.Name) for t in st.targets)
+    if isinstance(st, ast.AnnAssign):
+        return isinstance(st.target, ast.Name)
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return all(isinstance(d, (ast.Name, ast.Attribute)) for d in st.decorator_list)
+    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+
+
+def _new_lines(hunks):
+    """New-file line numbers of the added lines."""
+    out, offset = [], 0
+    for start, body in hunks:
+        new = start + offset
+        for l in body:
+            tag = l[:1]
+            if tag == " ":
+                new += 1
+            elif tag == "+":
+                out.append(new)
+                new += 1
+                offset += 1
+            elif tag == "-":
+                offset -= 1
+    return out
 
 
 def _outermost_def(tree, lo, hi):
@@ -1727,9 +1796,35 @@ class Selector:
         gives exactly the pristine results (see TpcProbe)."""
         got = self._probe_inputs(changes, self.tpc)
         if got is None:
+            self._tpc_class_plan_check(changes, chosen, why)
             return
         patched, ranges = got
         self._tpc_probe_ranges(patched, ranges, chosen, why)
+
+    def _tpc_class_plan_check(self, changes, chosen, why):
+        """The plan check for changes with class-level code (see _class_plan_inputs): every
+        query, since import-time code can reach any of them."""
+        try:
+            got = self._class_plan_inputs(changes)
+        except Exception:
+            return
+        if got is None:
+            return
+        patched, qs = got
+        if time.monotonic() - START > TpcProbe.RUN_LIMIT:
+            return
+        saving = cost_of(split(chosen, self.durations), self.durations) - \
+            cost_of(split(chosen - {self.tpc}, self.durations), self.durations)
+        pcost = self.tpc_probe.prep_cost(qs)
+        if pcost is None or pcost > self.tpc_probe.PREP_BUDGET or pcost > saving - 3:
+            why.append(f"TPC-DS class plan check skipped (~{pcost}s CPU vs {saving:.1f}s saved)")
+            return
+        if self.tpc_probe.run(patched, qs, timeout=max(20.0, 4 * pcost), mode="prep"):
+            chosen.discard(self.tpc)
+            why.append(f"TPC-DS class plan check: all {len(qs)} queries plan exactly as pristine "
+                       f"(class-level change outside the execution stage) -> drop test_execute_tpcds")
+        else:
+            why.append("TPC-DS class plan check: a plan differs -> keep")
 
     def _probe_inputs(self, changes, test):
         """(patched files, changed line ranges inside function bodies) for a probe of one
@@ -1783,6 +1878,95 @@ class Selector:
         if not ranges:
             return None
         return patched, ranges
+
+    def _class_plan_inputs(self, changes):
+        """For a change with class-level (import-time) code: (patched files, all queries) if the
+        TPC-DS execution stage cannot see it, else None. Every changed function must be one
+        the execution stage never runs (nor table setup); every class-level edit must only
+        bind names, inside classes the execution stage never uses (nor any subclass, nor any
+        enclosing class) and never names; module-level edits are never accepted."""
+        tp = self.tpc_probe
+        if tp is None or not tp._load() or tp.euse is None or tp.e_lines is None:
+            return None
+        m = tp.loaded[0]
+        patched, classy = {}, False
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return None
+            path = ch.old
+            if not path.endswith(".py"):
+                if path.rsplit("/", 1)[-1] in PYTEST_FILES | PYTEST_SECTION_FILES:
+                    return None
+                sid_ = self.opened.get(path)
+                if sid_ is not None and self.tpc in self.sets[sid_]:
+                    return None
+                if sid_ is None and path.startswith(("sqlglot/", "tests/")):
+                    return None
+                continue
+            info = self.files.get(path)
+            if info is None or not path.startswith(("sqlglot/", "tests/")):
+                return None
+            if self.tpc not in self.sets[info["all"]]:
+                continue
+            if not path.startswith("sqlglot/"):
+                return None
+            src = SRC / path
+            if not src.exists():
+                return None
+            original = src.read_text()
+            new_text = rebuild(original, ch.hunks)
+            if new_text is None:
+                return None
+            try:
+                compile(new_text, path, "exec")
+                old_tree = self.ast_cache.get(path)
+                if old_tree is None:
+                    old_tree = self.ast_cache[path] = ast.parse(original)
+                new_tree = ast.parse(new_text)
+            except Exception:
+                return None
+            if same_code(original, new_text):
+                continue
+            module = path[:-3].replace("/", ".")
+            if module.endswith(".__init__"):
+                module = module[: -len(".__init__")]
+            e = tp.e_lines.get(path, set())
+            setup = m["base"].get(path, set()) | m["unmodeled"].get(path, set())
+
+            def func_ok(fn):
+                body = range(fn.body[0].lineno, fn.end_lineno + 1)
+                return not any(l in e for l in range(fn.lineno, fn.end_lineno + 1)) and \
+                    not any(l in setup for l in body)
+
+            def class_ok(chain):
+                if not chain or chain[0] in tp.euse_names:
+                    return False
+                return all(f"{module}:{'.'.join(chain[:k])}" not in tp.euse for k in range(1, len(chain) + 1))
+
+            sides = [(old_tree, sorted(ch.points), True), (new_tree, _new_lines(ch.hunks), False)]
+            for tree, lines, is_old in sides:
+                for line in lines:
+                    kind, st, chain = _locate(tree, line)
+                    if kind == "module":
+                        return None
+                    if kind == "func":
+                        fn = st if is_old else _find_def(old_tree, chain)
+                        if fn is not None:
+                            if not func_ok(fn):
+                                return None
+                            continue
+                        # a brand-new function: only as a method (a class-level binding)
+                        if len(chain) < 2 or not class_ok(chain[:-1]) or not _declaration(st):
+                            return None
+                        classy = True
+                        continue
+                    if not class_ok(chain) or not _declaration(st):
+                        return None
+                    classy = True
+            patched[path] = new_text
+        if not patched or not classy:
+            return None
+        return patched, list(range(len(tp.loaded[1])))
 
     def _tpc_probe_ranges(self, patched, ranges, chosen, why):
         qs = self.tpc_probe.affected(ranges)
