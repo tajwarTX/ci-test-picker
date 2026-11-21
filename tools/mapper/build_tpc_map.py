@@ -73,7 +73,50 @@ for rel, ls in json.load(open(ew)).items():
 d = e.setdefault("sqlglot/executor/__init__.py", {})
 for l in range(_fn.lineno, _fn.end_lineno + 1):
     d[l] = d.get(l, 0) | all_exec
+# classes the execution stage uses (fresh per-query runs + one warm run, MRO included), and
+# every identifier in the statements it runs plus in those classes' own bodies
+eu = os.path.join(cov_dir, "euse.json")
+if not os.path.exists(eu):
+    sys.exit("REFUSING: no execution-stage class usage (euse.json)")
+euse = sorted(json.load(open(eu)))
+names = set()
+def _names(node):
+    for n in _ast.walk(node):
+        if isinstance(n, _ast.Name):
+            names.add(n.id)
+        elif isinstance(n, _ast.Attribute):
+            names.add(n.attr)
+for rel, dd in e.items():
+    path = os.path.join("/src", rel)
+    if not os.path.exists(path):
+        continue
+    tree = _ast.parse(open(path).read())
+    lines = set(dd)
+    for st_ in _ast.walk(tree):
+        if isinstance(st_, _ast.stmt) and st_.lineno in lines:
+            _names(st_)
+by_mod = {}
+for k in euse:
+    mod, qual = k.split(":", 1)
+    by_mod.setdefault(mod, set()).add(qual)
+for mod, quals in by_mod.items():
+    rel = mod.replace(".", "/") + ".py"
+    path = os.path.join("/src", rel)
+    if not os.path.exists(path):
+        path = os.path.join("/src", mod.replace(".", "/"), "__init__.py")
+        if not os.path.exists(path):
+            continue
+    tree = _ast.parse(open(path).read())
+    def walk(stmts, prefix):
+        for st in stmts:
+            if isinstance(st, _ast.ClassDef):
+                q = prefix + st.name
+                if q in quals:
+                    _names(st)  # bases, decorators and the whole body
+                walk(st.body, q + ".")
+    walk(tree.body, "")
 res = {"base": {r: sorted(v) for r, v in base.items()},
+       "euse": euse, "euse_names": sorted(names),
        "e": {r: sorted([l, m] for l, m in dd.items()) for r, dd in e.items()},
        "executed": executed,
        "q": {r: sorted([l, m] for l, m in d.items()) for r, d in q.items()},

@@ -98,6 +98,41 @@ elif mode == "equery":
     _ = (result.columns, result.rows)
     cov.stop()
     name = f"e{i:03d}"
+elif mode == "euse":
+    # classes the EXECUTION stage uses (methods run with self/cls bound to them or a
+    # subclass; whole MRO), for one executed query in a fresh process, or "all" warm
+    import logging
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.planner import Plan
+    import tpc_probe
+    import class_usage
+
+    schema, load_pairs = tpc_probe._helpers()
+    executed = [int(x) for x in open(os.path.join(out, "executed.txt")).read().split()]
+    which = executed if sys.argv[3] == "all" else [int(sys.argv[3])]
+    rows = {t: tpc_probe._read_rows(t) for t in schema}
+    tables = tpc_probe._Tables(schema, rows)
+    work = []
+    for i in which:
+        opt, names = pickle.load(open(os.path.join(out, f"opt{i:03d}.pickle"), "rb"))
+        work.append((opt, {t: tables[t] for t in names}))
+    class_usage.install()
+    for opt, used in work:
+        tables_ = ensure_tables(used)
+        plan = Plan(opt)
+        logging.getLogger("sqlglot").debug("Logical Plan: %s", plan)
+        result = pickle.loads(pickle.dumps(PythonExecutor(tables=tables_).execute(plan)))
+        _ = (result.columns, result.rows)
+    sys.setprofile(None)
+    keys = set()
+    for t in list(class_usage._seen):
+        for k in getattr(t, "__mro__", ()):
+            mod = getattr(k, "__module__", "") or ""
+            if mod.startswith("sqlglot"):
+                keys.add(f"{mod}:{k.__qualname__}")
+    json.dump(sorted(keys), open(os.path.join(out, f"euse_{sys.argv[3]}.json"), "w"))
+    sys.exit(0)
 elif mode == "ewarm":
     # ONE process running the execution stage of every executed query in turn (warm
     # caches, like a pool worker): lines only a warm run reaches join the execution map
