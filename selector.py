@@ -2051,6 +2051,16 @@ class Selector:
                 rel = module.replace(".", "/") + "/__init__.py"
             chain = qual.split(".") if qual else []
             if kinds.get(key) == "function" and how == "changed":
+                # judge a changed function where it is DEFINED (re-exports and aliases are
+                # the same object); both sides must agree on the home
+                home = diff.get("homes", {}).get(key)
+                if not home or home[0] != home[1] or home[0] is None:
+                    return False
+                module, hq = home[0].split(":", 1)
+                rel = module.replace(".", "/") + ".py"
+                if not (SRC / rel).exists():
+                    rel = module.replace(".", "/") + "/__init__.py"
+                chain, attr = hq.split(".")[:-1], hq.split(".")[-1]
                 tree = self.ast_cache.get(rel)
                 if tree is None:
                     try:
@@ -2067,6 +2077,7 @@ class Selector:
                     if fn.body and any(l in setup for l in range(fn.body[0].lineno, fn.end_lineno + 1)):
                         return False
                     continue
+                return False  # no plain def found at its home
             if chain:
                 unused = chain[0] not in tp.euse_names and all(
                     f"{module}:{'.'.join(chain[:k])}" not in tp.euse for k in range(1, len(chain) + 1))
