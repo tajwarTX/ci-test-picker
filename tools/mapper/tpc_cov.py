@@ -133,6 +133,80 @@ elif mode == "euse":
                 keys.add(f"{mod}:{k.__qualname__}")
     json.dump(sorted(keys), open(os.path.join(out, f"euse_{sys.argv[3]}.json"), "w"))
     sys.exit(0)
+elif mode == "edyn":
+    # attribute names the EXECUTION stage uses dynamically (getattr & co with string
+    # names) and objects whose whole namespace it reads (vars/dir)
+    import builtins
+    import logging
+    import operator
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.planner import Plan
+    import tpc_probe
+
+    schema, load_pairs = tpc_probe._helpers()
+    executed = [int(x) for x in open(os.path.join(out, "executed.txt")).read().split()]
+    which = executed if sys.argv[3] == "all" else [int(sys.argv[3])]
+    rows = {t: tpc_probe._read_rows(t) for t in schema}
+    tables = tpc_probe._Tables(schema, rows)
+    work = []
+    for i in which:
+        opt, names = pickle.load(open(os.path.join(out, f"opt{i:03d}.pickle"), "rb"))
+        work.append((opt, {t: tables[t] for t in names}))
+    seen_names, whole = set(), set()
+
+    def tname(o):
+        t = o if isinstance(o, type) else type(o)
+        return f"{getattr(t, '__module__', '')}:{getattr(t, '__qualname__', t.__name__)}"
+
+    saved = {n: getattr(builtins, n) for n in ("getattr", "hasattr", "setattr", "delattr", "vars", "dir")}
+    saved_op = (operator.attrgetter, operator.methodcaller)
+
+    def rec_name(fn):
+        def w(obj, name, *a):
+            if isinstance(name, str):
+                seen_names.add(name)
+            return fn(obj, name, *a)
+        return w
+
+    def rec_whole(fn):
+        def w(*a):
+            if a:
+                whole.add(tname(a[0]))
+            else:
+                whole.add("<frame>")
+            return fn(*a)
+        return w
+
+    def attrgetter(*names):
+        for n in names:
+            if isinstance(n, str):
+                seen_names.update(n.split("."))
+        return saved_op[0](*names)
+
+    def methodcaller(name, *a, **k):
+        if isinstance(name, str):
+            seen_names.add(name)
+        return saved_op[1](name, *a, **k)
+
+    for n in ("getattr", "hasattr", "setattr", "delattr"):
+        setattr(builtins, n, rec_name(saved[n]))
+    builtins.vars, builtins.dir = rec_whole(saved["vars"]), rec_whole(saved["dir"])
+    operator.attrgetter, operator.methodcaller = attrgetter, methodcaller
+    try:
+        for opt, used in work:
+            tables_ = ensure_tables(used)
+            plan = Plan(opt)
+            logging.getLogger("sqlglot").debug("Logical Plan: %s", plan)
+            result = pickle.loads(pickle.dumps(PythonExecutor(tables=tables_).execute(plan)))
+            _ = (result.columns, result.rows)
+    finally:
+        for n, f in saved.items():
+            setattr(builtins, n, f)
+        operator.attrgetter, operator.methodcaller = saved_op
+    json.dump({"names": sorted(seen_names), "whole_types": sorted(whole)},
+              open(os.path.join(out, f"edyn_{sys.argv[3]}.json"), "w"))
+    sys.exit(0)
 elif mode == "ewarm":
     # ONE process running the execution stage of every executed query in turn (warm
     # caches, like a pool worker): lines only a warm run reaches join the execution map

@@ -346,6 +346,8 @@ class TpcProbe:
                     self.prep, self.prep_fixed = doc["queries"], doc.get("fixed")
                     self.e_lines = {r: {l for l, _ in v} for r, v in m["e"].items()}
                     self.euse, self.euse_names = set(m["euse"]), set(m["euse_names"])
+                    self.edyn_names = set(m.get("edyn_names", ())) if "edyn_names" in m else None
+                    self.edyn_whole = set(m.get("edyn_whole", ()))
                     if len(self.prep) != len(pr):
                         raise ValueError
                 except Exception:
@@ -536,7 +538,9 @@ def _run_patched(checker, patched, args, timeout, capture=False):
             f.write_text(text)
         env = dict(os.environ, PYTHONPATH=str(checker.work), PYTHONDONTWRITEBYTECODE="1",
                    PYTHONHASHSEED="0", TPC_SRC=str(SRC), BR_STOP_ON_FAIL="1")
-        script, rest = (APP / "runner.py", args[1:]) if args and args[0] == "--runner" else (APP / "tpc_probe.py", args)
+        script, rest = (APP / "runner.py", args[1:]) if args and args[0] == "--runner" else \
+            (APP / "snapshot.py", ["diff", str(APP / "tpc" / "snap.json.gz")]) if args and args[0] == "--snap" else \
+            (APP / "tpc_probe.py", args)
         proc = subprocess.run([sys.executable, str(script), *rest], cwd="/tmp", env=env,
                               stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=timeout, text=True)
@@ -1809,6 +1813,10 @@ class Selector:
         except Exception:
             return
         if got is None:
+            try:
+                self._tpc_snap_plan_check(changes, chosen, why)
+            except Exception:
+                pass
             return
         patched, qs = got
         if time.monotonic() - START > TpcProbe.RUN_LIMIT:
@@ -1967,6 +1975,142 @@ class Selector:
         if not patched or not classy:
             return None
         return patched, list(range(len(tp.loaded[1])))
+
+    SNAP_COST = 2.0  # fresh interpreter + patched import + hashing (estimate)
+
+    def _snap_patched(self, changes):
+        """Patched sqlglot files for the snapshot check, or None (same file rules as the
+        other TPC-DS checks: data files the test reads, test files, configs -> None)."""
+        patched = {}
+        for ch in changes:
+            if ch.binary or ch.old is None or ch.old != ch.new:
+                return None
+            path = ch.old
+            if not path.endswith(".py"):
+                if path.rsplit("/", 1)[-1] in PYTEST_FILES | PYTEST_SECTION_FILES:
+                    return None
+                sid_ = self.opened.get(path)
+                if sid_ is not None and self.tpc in self.sets[sid_]:
+                    return None
+                if sid_ is None and path.startswith(("sqlglot/", "tests/")):
+                    return None
+                continue
+            info = self.files.get(path)
+            if info is None or not path.startswith(("sqlglot/", "tests/")):
+                return None
+            if self.tpc not in self.sets[info["all"]]:
+                continue
+            if not path.startswith("sqlglot/"):
+                return None
+            src = SRC / path
+            if not src.exists():
+                return None
+            original = src.read_text()
+            new_text = rebuild(original, ch.hunks)
+            if new_text is None:
+                return None
+            try:
+                compile(new_text, path, "exec")
+            except Exception:
+                return None
+            if not same_code(original, new_text):
+                patched[path] = new_text
+        return patched or None
+
+    def _snap_safe(self, diff):
+        """True if no name the import-state diff reports can be seen by the TPC-DS execution
+        stage (see _tpc_snap_plan_check)."""
+        tp = self.tpc_probe
+        if tp.edyn_names is None or tp.euse is None:
+            return False
+        names = tp.euse_names | tp.edyn_names
+        kinds = diff.get("kinds", {})
+        keys = [(k, "changed") for k in diff.get("changed", ())] + \
+               [(k, "added") for k in diff.get("added", ())] + [(k, "removed") for k in diff.get("removed", ())]
+        # keys whose pristine hash is not stable across runs: judged as if changed
+        keys += [(k, "changed") for k in diff.get("unstable_touched", ()) if (k, "changed") not in keys]
+        real = [k for k, _ in keys if k not in set(diff.get("unstable_touched", ()))]
+        if not real:
+            return False  # nothing changed at import: the other checks decide
+        class_touch = any(kinds.get(k) == "class" for k, how in keys if how != "changed") or \
+            any(k.endswith((":__bases__", ":__mro__")) for k, _ in keys)
+        if class_touch and ({"__subclasses__", "subclasses"} & names):
+            return False
+        for key, how in keys:
+            if kinds.get(key) == "opaque" or "opaque" in str(kinds.get(key)):
+                return False
+            parts = key.split(":")
+            if len(parts) == 2:
+                module, qual, attr = parts[0], None, parts[1]
+            elif len(parts) == 3:
+                module, qual, attr = parts
+            else:
+                return False
+            rel = module.replace(".", "/") + ".py"
+            if not (SRC / rel).exists():
+                rel = module.replace(".", "/") + "/__init__.py"
+            chain = qual.split(".") if qual else []
+            if kinds.get(key) == "function" and how == "changed":
+                tree = self.ast_cache.get(rel)
+                if tree is None:
+                    try:
+                        tree = self.ast_cache[rel] = ast.parse((SRC / rel).read_text())
+                    except Exception:
+                        return False
+                fn = _find_def(tree, chain + [attr])
+                if fn is not None:
+                    e = tp.e_lines.get(rel, set())
+                    m = tp.loaded[0]
+                    setup = m["base"].get(rel, set()) | m["unmodeled"].get(rel, set())
+                    if any(l in e for l in range(fn.lineno, fn.end_lineno + 1)):
+                        return False
+                    if fn.body and any(l in setup for l in range(fn.body[0].lineno, fn.end_lineno + 1)):
+                        return False
+                    continue
+            if chain:
+                unused = chain[0] not in tp.euse_names and all(
+                    f"{module}:{'.'.join(chain[:k])}" not in tp.euse for k in range(1, len(chain) + 1))
+                if unused:
+                    continue
+                # the execution stage reads the whole namespace of the classes in edyn_whole
+                # (generator dispatch); any other class only through names it reads
+                if attr in names or attr.startswith("__") or f"{module}:{qual}" in tp.edyn_whole:
+                    return False
+                continue
+            if attr in names or f"{module}" in tp.edyn_whole:
+                return False
+        return True
+
+    def _tpc_snap_plan_check(self, changes, chosen, why):
+        """Import-time changes the class plan check cannot clear: diff the patched package's
+        import state against the pinned one (snapshot.py); if no changed name can reach the
+        execution stage, plan every query on the patched code and compare with pristine."""
+        tp = self.tpc_probe
+        if not tp._load() or tp.edyn_names is None or time.monotonic() - START > TpcProbe.RUN_LIMIT:
+            return
+        patched = self._snap_patched(changes)
+        if patched is None:
+            return
+        saving = cost_of(split(chosen, self.durations), self.durations) - \
+            cost_of(split(chosen - {self.tpc}, self.durations), self.durations)
+        qs = list(range(len(tp.loaded[1])))
+        pcost = tp.prep_cost(qs)
+        if pcost is None or pcost + self.SNAP_COST > tp.PREP_BUDGET or pcost + self.SNAP_COST > saving - 3:
+            return
+        out = _run_patched(tp.checker, patched, ["--snap"], 60, capture=True)
+        try:
+            diff = json.loads(out.strip().splitlines()[-1])
+        except Exception:
+            return
+        if not self._snap_safe(diff):
+            why.append("TPC-DS import-state check: a changed name can reach the execution stage -> keep")
+            return
+        if tp.run(patched, qs, timeout=max(20.0, 4 * pcost), mode="prep"):
+            chosen.discard(self.tpc)
+            why.append(f"TPC-DS import-state check: {len(diff.get('changed', ())) + len(diff.get('added', ())) + len(diff.get('removed', ()))} "
+                       f"changed names, none seen by the execution stage; all {len(qs)} queries plan as pristine -> drop test_execute_tpcds")
+        else:
+            why.append("TPC-DS import-state check: a plan differs -> keep")
 
     def _tpc_probe_ranges(self, patched, ranges, chosen, why):
         qs = self.tpc_probe.affected(ranges)

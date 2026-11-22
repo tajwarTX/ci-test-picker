@@ -86,6 +86,8 @@ def _names(node):
             names.add(n.id)
         elif isinstance(n, _ast.Attribute):
             names.add(n.attr)
+        elif isinstance(n, _ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+            names.add(n.value)
 for rel, dd in e.items():
     path = os.path.join("/src", rel)
     if not os.path.exists(path):
@@ -115,8 +117,19 @@ for mod, quals in by_mod.items():
                     _names(st)  # bases, decorators and the whole body
                 walk(st.body, q + ".")
     walk(tree.body, "")
+# dynamic execution-stage attribute names and whole-namespace reads (edyn runs: warm "all"
+# plus one fresh run per executed query); all are required
+edyn_names, edyn_whole = set(), set()
+for qname in ["all"] + [str(i) for i in executed]:
+    fpath = os.path.join(cov_dir, f"edyn_{qname}.json")
+    if not os.path.exists(fpath):
+        sys.exit(f"REFUSING: missing {fpath}")
+    dyn = json.load(open(fpath))
+    edyn_names.update(dyn["names"])
+    edyn_whole.update(dyn["whole_types"])
 res = {"base": {r: sorted(v) for r, v in base.items()},
        "euse": euse, "euse_names": sorted(names),
+       "edyn_names": sorted(edyn_names), "edyn_whole": sorted(edyn_whole),
        "e": {r: sorted([l, m] for l, m in dd.items()) for r, dd in e.items()},
        "executed": executed,
        "q": {r: sorted([l, m] for l, m in d.items()) for r, d in q.items()},

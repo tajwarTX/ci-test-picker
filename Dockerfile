@@ -23,6 +23,7 @@ RUN python -m compileall -q /app/src/sqlglot \
 
 # Coverage/class-usage map built from the pinned commit (tools/mapper), committed as a plain file.
 COPY tpc_probe.py /app/tpc_probe.py
+COPY snapshot.py /app/snapshot.py
 # pristine TPC-DS results for the probe (two hash seeds: unstable queries are marked)
 RUN mkdir /app/tpc && cd /tmp \
  && PYTHONPATH=/app/src PYTHONHASHSEED=0 python /app/tpc_probe.py build /app/tpc \
@@ -32,6 +33,8 @@ RUN mkdir /app/tpc && cd /tmp \
  && PYTHONPATH=/app/src PYTHONHASHSEED=0 python /app/tpc_probe.py tpch-build /app/tpc \
  && PYTHONPATH=/app/src PYTHONHASHSEED=1 python /app/tpc_probe.py tpch /app/tpc exec opt \
  && PYTHONPATH=/app/src python /app/tpc_probe.py genmem \
+ && PYTHONPATH=/app/src PYTHONHASHSEED=0 python /app/snapshot.py build /app/tpc/snap.json.gz \
+ && PYTHONPATH=/app/src PYTHONHASHSEED=1 python /app/snapshot.py check /app/tpc/snap.json.gz \
  && test -s /app/tpc/pristine.json && test -s /app/tpc/prep.json && test -s /app/tpc/rows.pickle && test -s /app/tpc/tpch.json
 COPY runner.py /app/runner.py
 COPY selector.py /app/selector.py
