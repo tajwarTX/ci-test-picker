@@ -1637,22 +1637,58 @@ class Selector:
     # ---- DIAGNOSTIC ONLY (D-shape, never a final entry) ---------------------------------
     shape_code = None
 
+    def _snap_reasons(self, diff):
+        """Bitmask of what makes the diff unsafe: 1 function home issue, 2 attribute of a
+        class the execution stage reads wholesale, 4 a name it reads (E-used class attr or
+        module global), 8 hierarchy/opaque/__subclasses__, 16 the diff adds a class."""
+        tp = self.tpc_probe
+        names = tp.euse_names | tp.edyn_names
+        kinds, mask = diff.get("kinds", {}), 0
+        keys = [(k, "changed") for k in diff.get("changed", ())] + \
+               [(k, "added") for k in diff.get("added", ())] + [(k, "removed") for k in diff.get("removed", ())]
+        if any(kinds.get(k) == "class" for k, how in keys if how == "added"):
+            mask |= 16
+        if any(kinds.get(k) == "class" for k, how in keys if how != "changed") or \
+                any(k.endswith((":__bases__", ":__mro__")) for k, _ in keys):
+            if {"__subclasses__", "subclasses"} & names:
+                mask |= 8
+        for key, how in keys:
+            if "opaque" in str(kinds.get(key)):
+                mask |= 8
+                continue
+            parts = key.split(":")
+            if len(parts) not in (2, 3):
+                mask |= 8
+                continue
+            module, qual, attr = (parts[0], None, parts[1]) if len(parts) == 2 else parts
+            chain = qual.split(".") if qual else []
+            if kinds.get(key) == "function" and how == "changed":
+                one = {"changed": [key], "kinds": {key: "function"}, "homes": {key: diff.get("homes", {}).get(key)}}
+                if not self._snap_safe(one):
+                    mask |= 1
+                continue
+            if chain:
+                unused = chain[0] not in tp.euse_names and all(
+                    f"{module}:{'.'.join(chain[:k])}" not in tp.euse for k in range(1, len(chain) + 1))
+                if unused:
+                    continue
+                if f"{module}:{qual}" in tp.edyn_whole:
+                    mask |= 2
+                elif attr in names or attr.startswith("__"):
+                    mask |= 4
+                continue
+            if attr in names or module in tp.edyn_whole:
+                mask |= 4
+        return mask
+
     def _shape_bits(self, patch_text):
-        """1 snapshot check applicable (patched files ok), 2 diff safe for the execution
-        stage, 4 all plans identical to pristine."""
         changes = parse_patch(patch_text)
         patched = self._snap_patched(changes)
         if patched is None:
-            return 0
-        bits = 1
+            return None
         out = _run_patched(self.tpc_probe.checker, patched, ["--snap"], 60, capture=True)
         diff = json.loads(out.strip().splitlines()[-1])
-        if self._snap_safe(diff):
-            bits |= 2
-        qs = list(range(len(self.tpc_probe.loaded[1])))
-        if self.tpc_probe.run(patched, qs, timeout=300, mode="prep"):
-            bits |= 4
-        return bits
+        return self._snap_reasons(diff)
 
     def diag_shape(self, patch_text, chosen, why):
         if self.tpc not in chosen or self.shape_code is not None:
@@ -2297,5 +2333,5 @@ def _burn_to(target):
 if __name__ == "__main__":
     main()
     code = Selector.shape_code
-    _burn_to(100.0 if code is None else 100.0 + 4.0 * (code + 1))
+    _burn_to(100.0 if code is None else 101.0 + 1.5 * code)
 
