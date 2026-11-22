@@ -91,7 +91,59 @@ def _install_case_filter():
                 setattr(m, name, wrapped)
 
 
-def main(ids, cases=None):
+def droppable_statements(fn):
+    """Top-level statements of a test method body that a sliced run may leave out: plain
+    expression statements that are calls (self.validate_identity(...), ...). Everything
+    else (assignments, with/for/if/try blocks, asserts, returns) always stays."""
+    return [st for st in fn.body if isinstance(st, _ast.Expr) and isinstance(st.value, _ast.Call)]
+
+
+def sliced_method(cls, meth, keep_lines):
+    """The test method `meth` of `cls` recompiled from its source with only the droppable
+    statements whose first line is in keep_lines (all other statements kept). None if
+    the method cannot be rebuilt exactly (decorated, uses super()/__class__, closures)."""
+    import inspect
+    import textwrap
+    func = cls.__dict__.get(meth)
+    if not isinstance(func, _types.FunctionType) or func.__code__.co_freevars or func.__closure__:
+        return None
+    try:
+        lines, first = inspect.getsourcelines(func)
+    except (OSError, TypeError):
+        return None
+    src = textwrap.dedent("".join(lines))
+    tree = _ast.parse(src)
+    fn = tree.body[0]
+    if not isinstance(fn, _ast.FunctionDef) or fn.decorator_list or fn.name != meth:
+        return None
+    _ast.increment_lineno(tree, first - 1)
+    drop = {id(st) for st in droppable_statements(fn) if st.lineno not in keep_lines}
+    fn.body = [st for st in fn.body if id(st) not in drop] or [_ast.Pass()]
+    _ast.fix_missing_locations(tree)
+    ns = {}
+    exec(compile(tree, func.__code__.co_filename, "exec"), func.__globals__, ns)
+    new = ns[meth]
+    new.__qualname__ = func.__qualname__
+    return new
+
+
+_STMTS: dict = {}  # test id -> set of first lines of the droppable statements to keep
+
+
+def _install_stmt_slices(suites):
+    for (mod, cls), cases in suites.items():
+        for case in cases:
+            keep = _STMTS.get(case._br_id)
+            if keep is None:
+                continue
+            klass = type(case)
+            new = sliced_method(klass, case._testMethodName, keep)
+            if new is None:
+                raise RuntimeError("cannot slice " + case._br_id)
+            setattr(klass, case._testMethodName, new)
+
+
+def main(ids, cases=None, stmts=None):
     os.environ["SKIP_INTEGRATION"] = "0"
     cf.ProcessPoolExecutor = SyncExecutor
     import concurrent.futures.process as cfp
@@ -112,6 +164,10 @@ def main(ids, cases=None):
             continue
         case._br_id = tid
         suites.setdefault((mod, cls), []).append(case)
+    if stmts:
+        _STMTS.clear()
+        _STMTS.update({t: set(v) for t, v in stmts.items()})
+        _install_stmt_slices(suites)
     if cases:
         _CASES.clear()
         _CASES.update({t: {tuple(c) for c in v} for t, v in cases.items()})
@@ -251,7 +307,7 @@ def serve():
                     with contextlib.redirect_stdout(buf):
                         if req.get("nostop"):
                             os.environ["BR_STOP_ON_FAIL"] = "0"
-                        main(req["ids"], req.get("cases"))
+                        main(req["ids"], req.get("cases"), req.get("stmts"))
                     out.write(buf.getvalue().strip().splitlines()[-1])
             except BaseException:  # noqa: BLE001
                 out.write(json.dumps({"error": True}))

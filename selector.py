@@ -1318,6 +1318,41 @@ class Selector:
             self._case_map = cm
         return cm
 
+    def stmt_map(self):
+        sm = self.__dict__.get("_stmt_map", 0)
+        if sm == 0:
+            try:
+                sm = json.load(gzip.open(APP / "stmt_map.json.gz", "rt"))["tests"]
+            except Exception:
+                sm = None
+            self._stmt_map = sm
+        return sm
+
+    def _reduced_keep(self, patched, info):
+        """Positions (cases or statements) of a map entry that reach a changed function, or
+        None if the change cannot be reduced for it (import-time code, or a changed function
+        that the test's no-case / no-statement run already reaches)."""
+        keep = set()
+        for rel, new_text in patched.items():
+            original = (SRC / rel).read_text()
+            if same_code(original, new_text):
+                continue
+            ch = next((c for c in parse_patch_cache(self, rel)), None)
+            if ch is None or not ch.points:
+                return None
+            tree = self.ast_cache.get(rel) or ast.parse(original)
+            self.ast_cache[rel] = tree
+            pre = set(info["pre_funcs"].get(rel, ()))
+            funcs = info["funcs"].get(rel, {})
+            for p in ch.points:
+                fn = _outermost_def(tree, p, p)
+                if fn is None or not (fn.body and fn.body[0].lineno <= p):
+                    return None
+                if fn.lineno in pre:
+                    return None
+                keep.update(funcs.get(str(fn.lineno), ()))
+        return sorted(keep)
+
     def _reduced_cases(self, patched, tid):
         """Allowed fixture cases for test tid under this change, or None if it cannot be
         reduced: every change must lie in function bodies (outermost def known), none of
@@ -1357,8 +1392,11 @@ class Selector:
             return chosen
         secs = {n: self.durations[n] / 1000 for n in chosen}
         full = cost_of(split(chosen, self.durations), self.durations)
+        got = self._verify_reduced(patch_text, chosen, why, secs, full)
+        if got is not None:
+            return got
         if max(secs.values()) > self.RUN_MAX_TEST or sum(secs.values()) > self.RUN_MAX_TOTAL:
-            return self._verify_reduced(patch_text, chosen, why, secs, full)
+            return chosen
         # measured: ~0.35 s start + sqlglot, ~0.15 s per test module, ~1.4 s more for a
         # module importing pandas/duckdb, and ~1.6x the recorded test seconds
         mods = {self.test_ids[n].split("::")[0] for n in chosen}
@@ -1401,56 +1439,56 @@ class Selector:
         return set()
 
     def _verify_reduced(self, patch_text, chosen, why, secs, full):
-        """Like verify_by_running, for selections holding long fixture-looping tests: those
-        run only the fixture cases that reach the changed functions (case map), the others
-        whole; through the warm fork server only, under a hard CPU limit."""
-        cm = self.case_map()
-        if not cm or not any(self.test_ids[n] in cm for n in chosen):
-            return chosen
+        """Run selected tests here, each as cheaply as possible (fixture-mapped tests on their
+        affected cases, statement-mapped tests on their affected statements, short unmapped
+        tests whole), through the warm fork server under a hard CPU limit; drop the ones that
+        pass. Picks the cheapest-first prefix that saves the most (net of CPU). None if this
+        path does not apply (then the plain small-selection path decides)."""
+        cm, sm = self.case_map() or {}, self.stmt_map() or {}
         try:
             changes = parse_patch(patch_text)
         except Exception:
-            return chosen
+            return None
         self._changes = {c.old: c for c in changes if c.old}
         patched = {}
         for ch in changes:
             if ch.binary or ch.old is None or ch.old != ch.new or not ch.old.startswith("sqlglot/") \
                     or not ch.old.endswith(".py"):
-                return chosen
+                return None
             src = SRC / ch.old
             if not src.exists():
-                return chosen
+                return None
             new_text = rebuild(src.read_text(), ch.hunks)
             if new_text is None:
-                return chosen
+                return None
             patched[ch.old] = new_text
-        # candidates: the case-mapped tests that can be reduced under this change, each run
-        # on only its affected fixture cases; the rest of the selection stays as it is
-        cand, cases, est_t = [], {}, {}
+        if self._swap_plan(patched) is None:
+            return None
+        cases, stmts, est_t = {}, {}, {}
         for n in chosen:
             tid = self.test_ids[n]
-            if tid not in cm:
-                continue
-            keep = self._reduced_cases(patched, tid)
-            if keep is None:
-                continue
-            info = cm[tid]
-            cand.append(n)
-            cases[tid] = [info["cases"][k] for k in keep]
-            cold = sum(info["cpu"][k] for k in keep)  # cold, per-fork: an upper bound
-            warm = 1.6 * (self.durations[n] / 1000) * len(keep) / max(len(info["cases"]), 1)
-            est_t[n] = info["pre_cpu"] + min(cold, warm)
+            sec = self.durations[n] / 1000
+            info, kind = (cm.get(tid), "case") if tid in cm else (sm.get(tid), "stmt") if tid in sm else (None, None)
+            keep = self._reduced_keep(patched, info) if info is not None else None
+            if keep is not None:
+                total = len(info["cases"] if kind == "case" else info["stmts"])
+                cold = sum(info["cpu"][k] for k in keep)
+                est_t[n] = info["pre_cpu"] + min(cold, 1.6 * sec * len(keep) / max(total, 1))
+                if kind == "case":
+                    cases[tid] = [info["cases"][k] for k in keep]
+                else:
+                    stmts[tid] = [info["stmts"][k] for k in keep]
+            elif sec <= self.RUN_MAX_TEST:
+                est_t[n] = 1.6 * sec
+        cand = sorted(est_t, key=lambda n: est_t[n] / max(self.durations[n], 1))
         if not cand:
             return chosen
-        # cheapest first while removing them still pays
-        cand.sort(key=lambda n: est_t[n] / max(self.durations[n], 1))
         done = self.__dict__.setdefault("_server_mods", set())
-        # the best-paying prefix (removing tests only pays once the busiest worker shrinks)
         best, pick, est, mods = (0.6, None, 0.0), [], 0.35, set()
         for n in cand:
             mod = self.test_ids[n].split("::")[0]
             if mod not in done and mod not in mods:
-                est += 0.8 if self._heavy_module(mod) else 0.15  # pandas is lazy in the server
+                est += 0.8 if self._heavy_module(mod) else 0.15
                 mods.add(mod)
             est += est_t[n]
             pick.append(n)
@@ -1462,13 +1500,12 @@ class Selector:
         if best[1] is None:
             return chosen
         _, pick, est = best
-        mods = {self.test_ids[n].split("::")[0] for n in pick}
-        if self._swap_plan(patched) is None:
-            return chosen
         ids = sorted(self.test_ids[n] for n in pick)
-        run_cases = {t: cases[t] for t in ids}
-        out = self._serve_run(patched, ids, cases=run_cases, cpu_limit=max(3.0, 2.5 * est), nostop=True)
-        done.update(mods)
+        run_cases = {t: cases[t] for t in ids if t in cases}
+        run_stmts = {t: stmts[t] for t in ids if t in stmts}
+        out = self._serve_run(patched, ids, cases=run_cases, stmts=run_stmts,
+                              cpu_limit=max(3.0, 2.5 * est), nostop=True)
+        done.update({self.test_ids[n].split("::")[0] for n in pick})
         if out is None:
             return chosen
         try:
@@ -1478,9 +1515,8 @@ class Selector:
         except Exception:
             return chosen
         passed = {n for n in pick if self.test_ids[n] not in failed}
-        why.append(f"ran {len(ids)} long fixture tests here on their affected cases "
-                   f"({sum(len(run_cases[t]) for t in ids)} cases, ~{est:.1f}s CPU): "
-                   f"{len(passed)} pass -> dropped")
+        why.append(f"ran {len(ids)} selected tests here ({len(run_cases)} on affected fixture cases, "
+                   f"{len(run_stmts)} on affected statements, ~{est:.1f}s CPU): {len(passed)} pass -> dropped")
         return chosen - passed
 
     def _swap_plan(self, patched):
@@ -1524,7 +1560,7 @@ class Selector:
                 self._imp = False
         return self._imp or None
 
-    def _serve_run(self, patched, ids, cases=None, cpu_limit=None, nostop=False):
+    def _serve_run(self, patched, ids, cases=None, cpu_limit=None, nostop=False, stmts=None):
         """Run through the warm fork server; None if not applicable or anything fails."""
         plan = self._swap_plan(patched)
         if not plan:
@@ -1538,8 +1574,8 @@ class Selector:
                     [sys.executable, str(APP / "runner.py"), "--serve"], cwd="/tmp", env=env, text=True,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             req = {"files": plan, "ids": ids}
-            if cases:
-                req["cases"], req["cpu_limit"] = cases, cpu_limit
+            if cases or stmts or cpu_limit:
+                req["cases"], req["stmts"], req["cpu_limit"] = cases or {}, stmts or {}, cpu_limit
             if nostop:
                 req["nostop"] = True
             srv.stdin.write(json.dumps(req) + "\n")
