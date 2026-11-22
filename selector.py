@@ -2055,7 +2055,8 @@ class Selector:
                 # the same object); both sides must agree on the home
                 home = diff.get("homes", {}).get(key)
                 if not home or home[0] != home[1] or home[0] is None:
-                    return False
+                    home = None  # a closure, lambda or rebinding: judged by its name below
+            if kinds.get(key) == "function" and how == "changed" and home is not None:
                 module, hq = home[0].split(":", 1)
                 rel = module.replace(".", "/") + ".py"
                 if not (SRC / rel).exists():
@@ -2077,7 +2078,9 @@ class Selector:
                     if fn.body and any(l in setup for l in range(fn.body[0].lineno, fn.end_lineno + 1)):
                         return False
                     continue
-                return False  # no plain def found at its home
+                # no plain def at its home: judged by the name it is stored under, below
+                module, qual, attr = (parts[0], None, parts[1]) if len(parts) == 2 else parts
+                chain = qual.split(".") if qual else []
             if chain:
                 unused = chain[0] not in tp.euse_names and all(
                     f"{module}:{'.'.join(chain[:k])}" not in tp.euse for k in range(1, len(chain) + 1))
