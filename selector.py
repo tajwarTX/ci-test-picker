@@ -348,6 +348,7 @@ class TpcProbe:
                     self.euse, self.euse_names = set(m["euse"]), set(m["euse_names"])
                     self.edyn_names = set(m.get("edyn_names", ())) if "edyn_names" in m else None
                     self.edyn_whole = set(m.get("edyn_whole", ()))
+                    self.ename_q = m.get("ename_q")
                     if len(self.prep) != len(pr):
                         raise ValueError
                 except Exception:
@@ -2017,7 +2018,7 @@ class Selector:
                 patched[path] = new_text
         return patched or None
 
-    def _snap_safe(self, diff):
+    def _snap_safe(self, diff, blocking=None):
         """True if no name the import-state diff reports can be seen by the TPC-DS execution
         stage (see _tpc_snap_plan_check)."""
         tp = self.tpc_probe
@@ -2088,11 +2089,19 @@ class Selector:
                     continue
                 # the execution stage reads the whole namespace of the classes in edyn_whole
                 # (generator dispatch); any other class only through names it reads
-                if attr in names or attr.startswith("__") or f"{module}:{qual}" in tp.edyn_whole:
+                if attr.startswith("__") or f"{module}:{qual}" in tp.edyn_whole:
                     return False
+                if attr in names:
+                    if blocking is None:
+                        return False
+                    blocking.add(attr)  # read by the execution stage: those queries run for real
                 continue
-            if attr in names or f"{module}" in tp.edyn_whole:
+            if f"{module}" in tp.edyn_whole:
                 return False
+            if attr in names:
+                if blocking is None:
+                    return False
+                blocking.add(attr)
         return True
 
     def _tpc_snap_plan_check(self, changes, chosen, why):
@@ -2116,13 +2125,34 @@ class Selector:
             diff = json.loads(out.strip().splitlines()[-1])
         except Exception:
             return
-        if not self._snap_safe(diff):
+        blocking = set()
+        if not self._snap_safe(diff, blocking):
             why.append("TPC-DS import-state check: a changed name can reach the execution stage -> keep")
             return
-        if tp.run(patched, qs, timeout=max(20.0, 4 * pcost), mode="prep"):
+        # queries whose execution stage reads a changed name are executed for real (full
+        # result vs pristine); the others cannot see the change past their (checked) plan
+        run_q = []
+        if blocking:
+            eq = tp.ename_q
+            if eq is None or any(b not in eq for b in blocking):
+                why.append("TPC-DS import-state check: a changed name has no per-query read map -> keep")
+                return
+            mask = 0
+            for b in blocking:
+                mask |= eq[b]
+            run_q = [i for i in qs if mask >> i & 1]
+            if any(tp.loaded[1][i].get("unstable") for i in run_q):
+                return
+            ecost = tp.cost(run_q)
+            if pcost + ecost + self.SNAP_COST > saving - 3 or ecost > tp.BUDGET:
+                why.append(f"TPC-DS import-state check: {len(run_q)} queries read the changed names "
+                           f"(~{ecost:.1f}s to run) -> keep")
+                return
+        if tp.run(patched, qs, timeout=max(20.0, 4 * pcost), mode="prep") and \
+                (not run_q or tp.run(patched, run_q, timeout=max(20.0, 4 * tp.cost(run_q)))):
             chosen.discard(self.tpc)
-            why.append(f"TPC-DS import-state check: {len(diff.get('changed', ())) + len(diff.get('added', ())) + len(diff.get('removed', ()))} "
-                       f"changed names, none seen by the execution stage; all {len(qs)} queries plan as pristine -> drop test_execute_tpcds")
+            why.append(f"TPC-DS import-state check: all {len(qs)} queries plan as pristine, {len(run_q)} that read "
+                       f"changed names execute as pristine -> drop test_execute_tpcds")
         else:
             why.append("TPC-DS import-state check: a plan differs -> keep")
 

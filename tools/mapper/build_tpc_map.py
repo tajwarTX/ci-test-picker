@@ -127,7 +127,30 @@ for qname in ["all"] + [str(i) for i in executed]:
     dyn = json.load(open(fpath))
     edyn_names.update(dyn["names"])
     edyn_whole.update(dyn["whole_types"])
+# per query: names its execution stage reads (identifiers of the statements it runs, from the
+# per-query execution coverage, plus its dynamic getattr/... names)
+ename_q = {}
+for rel, dd in e.items():
+    path = os.path.join("/src", rel)
+    if not os.path.exists(path):
+        continue
+    tree_ = _ast.parse(open(path).read())
+    for st_ in _ast.walk(tree_):
+        if isinstance(st_, _ast.stmt) and st_.lineno in dd:
+            mask_ = dd[st_.lineno]
+            for n_ in _ast.walk(st_):
+                nm = n_.id if isinstance(n_, _ast.Name) else n_.attr if isinstance(n_, _ast.Attribute) else \
+                    n_.value if isinstance(n_, _ast.Constant) and isinstance(n_.value, str) and n_.value.isidentifier() else None
+                if nm:
+                    ename_q[nm] = ename_q.get(nm, 0) | mask_
+for i_ in executed:
+    f_ = os.path.join(cov_dir, f"edyn_{i_}.json")
+    if not os.path.exists(f_):
+        sys.exit(f"REFUSING: no per-query dynamic names for query {i_}")
+    for nm in json.load(open(f_))["names"]:
+        ename_q[nm] = ename_q.get(nm, 0) | (1 << i_)
 res = {"base": {r: sorted(v) for r, v in base.items()},
+       "ename_q": ename_q,
        "euse": euse, "euse_names": sorted(names),
        "edyn_names": sorted(edyn_names), "edyn_whole": sorted(edyn_whole),
        "e": {r: sorted([l, m] for l, m in dd.items()) for r, dd in e.items()},
