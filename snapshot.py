@@ -181,6 +181,20 @@ class _Hasher:
              str(co.co_kwonlyargcount), str(co.co_flags), co.co_name]).encode())
 
 
+def _home(v):
+    """Where a function-like value is defined: "module:qualname" (None if not a plain def)."""
+    f = v
+    if isinstance(f, (staticmethod, classmethod)):
+        f = f.__func__
+    elif isinstance(f, property):
+        f = f.fget
+    elif isinstance(f, types.MethodType):
+        f = f.__func__
+    if isinstance(f, types.FunctionType) and "<" not in f.__qualname__:
+        return f"{f.__module__}:{f.__qualname__}"
+    return None
+
+
 def _kind(v):
     if isinstance(v, type):
         return "class"
@@ -213,7 +227,7 @@ def snapshot():
 
     def put(key, v):
         H.opaque = False
-        out[key] = [H.h(v).hex()[:20], _kind(v)]
+        out[key] = [H.h(v).hex()[:20], _kind(v), _home(v)]
         if H.opaque:
             opaque.append(key)
             if out[key][1] == "value":
@@ -274,7 +288,7 @@ def main():
         return 0
     if mode == "diff":
         unstable = set(doc["unstable"])
-        changed, added, removed, touched, kinds = [], [], [], [], {}
+        changed, added, removed, touched, kinds, homes = [], [], [], [], {}, {}
         for k in sorted(set(base) | set(snap)):
             a, b = base.get(k), snap.get(k)
             if a is not None and b is not None and a[0] == b[0]:
@@ -289,8 +303,9 @@ def main():
             else:
                 changed.append(k)
             kinds[k] = (b or a)[1]
+            homes[k] = [(x[2] if x is not None and len(x) > 2 else None) for x in (a, b)]
         print(json.dumps({"changed": changed, "added": added, "removed": removed,
-                          "unstable_touched": touched, "kinds": kinds, "cpu": round(cpu, 3)}))
+                          "unstable_touched": touched, "kinds": kinds, "homes": homes, "cpu": round(cpu, 3)}))
         return 0
     return 2
 
