@@ -36,6 +36,10 @@ class SyncExecutor(cf.Executor):
 
 
 class Result(unittest.TestResult):
+    def startTest(self, test):
+        _CURRENT[0] = getattr(test, "_br_id", None)
+        super().startTest(test)
+
     def __init__(self):
         super().__init__()
         self.bad = set()
@@ -57,7 +61,37 @@ class Result(unittest.TestResult):
         self.bad.add(self._id(test))
 
 
-def main(ids):
+_CASES: dict = {}  # test id -> set of allowed (loader, filename, idx); tests not listed run whole
+_CURRENT = [None]
+
+
+def _install_case_filter():
+    """Wrap the fixture loaders (in tests.helpers and every test module that bound them) so
+    that a test listed in _CASES only gets its allowed cases (key: loader name, file, index
+    in that call's sequence, the same key the case map was built with)."""
+    import tests.helpers as H
+    for name in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+        real = getattr(H, name)
+        if getattr(real, "_br_real", None) is not None:
+            continue
+
+        def make(real, name):
+            def gen(filename, *a, **k):
+                allow = _CASES.get(_CURRENT[0])
+                for i, item in enumerate(real(filename, *a, **k)):
+                    if allow is None or (name, filename, i) in allow:
+                        yield item
+            gen._br_real = real
+            return gen
+
+        wrapped = make(real, name)
+        setattr(H, name, wrapped)
+        for mname, m in list(sys.modules.items()):
+            if (mname == "tests" or mname.startswith("tests.")) and getattr(m, name, None) is real:
+                setattr(m, name, wrapped)
+
+
+def main(ids, cases=None):
     os.environ["SKIP_INTEGRATION"] = "0"
     cf.ProcessPoolExecutor = SyncExecutor
     import concurrent.futures.process as cfp
@@ -78,6 +112,10 @@ def main(ids):
             continue
         case._br_id = tid
         suites.setdefault((mod, cls), []).append(case)
+    if cases:
+        _CASES.clear()
+        _CASES.update({t: {tuple(c) for c in v} for t, v in cases.items()})
+        _install_case_filter()
     stop = os.environ.get("BR_STOP_ON_FAIL") == "1"
     for (mod, cls), cases in suites.items():
         if stop and failed:
@@ -141,8 +179,47 @@ def _swap(rel, new_text, changed_qualnames):
     return True
 
 
+def _lazy_pandas():
+    """Placeholders for pandas and pandas.testing in the fork-server parent: importing a
+    test module that does `from pandas.testing import assert_frame_equal` no longer loads
+    pandas (~0.7 s CPU). The first real use (calling assert_frame_equal, or any other
+    attribute of either module) imports the real pandas, puts it in sys.modules and
+    delegates, so behaviour is unchanged."""
+    if "pandas" in sys.modules:
+        return
+    import types
+
+    real = {}
+
+    def load():
+        if not real:
+            for k in ("pandas", "pandas.testing"):
+                if isinstance(sys.modules.get(k), _Lazy):
+                    del sys.modules[k]
+            import pandas
+            import pandas.testing
+            real["pandas"], real["pandas.testing"] = pandas, pandas.testing
+        return real
+
+    class _Lazy(types.ModuleType):
+        def __getattr__(self, name):
+            if name.startswith("__") and name.endswith("__"):
+                raise AttributeError(name)
+            return getattr(load()[self.__name__], name)
+
+    def assert_frame_equal(*a, **k):
+        return load()["pandas.testing"].assert_frame_equal(*a, **k)
+
+    pd, pdt = _Lazy("pandas"), _Lazy("pandas.testing")
+    pd.__path__ = []
+    pdt.assert_frame_equal = assert_frame_equal
+    pd.testing = pdt
+    sys.modules["pandas"], sys.modules["pandas.testing"] = pd, pdt
+
+
 def serve():
     os.environ["SKIP_INTEGRATION"] = "0"
+    _lazy_pandas()
     cf.ProcessPoolExecutor = SyncExecutor
     import concurrent.futures.process as cfp
     cfp.ProcessPoolExecutor = SyncExecutor
@@ -161,6 +238,10 @@ def serve():
             os.close(r)
             out = os.fdopen(w, "w")
             try:
+                if req.get("cpu_limit"):
+                    import resource
+                    lim = int(req["cpu_limit"]) + int(resource.getrusage(resource.RUSAGE_SELF).ru_utime) + 1
+                    resource.setrlimit(resource.RLIMIT_CPU, (lim, lim + 1))
                 ok = all(_swap(rel, d["text"], d["functions"]) for rel, d in req["files"].items())
                 if not ok:
                     out.write(json.dumps({"noswap": True}))
@@ -168,7 +249,9 @@ def serve():
                     import io, contextlib
                     buf = io.StringIO()
                     with contextlib.redirect_stdout(buf):
-                        main(req["ids"])
+                        if req.get("nostop"):
+                            os.environ["BR_STOP_ON_FAIL"] = "0"
+                        main(req["ids"], req.get("cases"))
                     out.write(buf.getvalue().strip().splitlines()[-1])
             except BaseException:  # noqa: BLE001
                 out.write(json.dumps({"error": True}))

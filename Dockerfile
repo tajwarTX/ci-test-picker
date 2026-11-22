@@ -39,6 +39,7 @@ COPY data/map.json.gz /app/map.json.gz
 COPY data/tpc_map.json.gz /app/tpc_map.json.gz
 COPY data/max_map.json.gz /app/max_map.json.gz
 COPY data/grpa_map.json.gz /app/grpa_map.json.gz
+COPY data/case_map.json.gz /app/case_map.json.gz
 COPY data/import_lines.json.gz /app/import_lines.json.gz
 # Same map in Python's binary format: loads several times faster at run time.
 RUN python -c "import gzip, json, pickle; pickle.dump(json.load(gzip.open('/app/map.json.gz', 'rt')), open('/app/map.pickle', 'wb'), protocol=pickle.HIGHEST_PROTOCOL)" \
